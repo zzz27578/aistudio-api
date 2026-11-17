@@ -1,4 +1,12 @@
-# Stage 1: Build native Go WAA signer daemon
+# Build the console from source so the fork never serves stale upstream bundles.
+FROM oven/bun:1.4.4 AS web-builder
+WORKDIR /build/web
+COPY web/package.json web/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY web/ ./
+RUN bun run lint && bun run build
+
+# Build native Go WAA signer daemon and run its offline regression suite.
 FROM golang:1.27-trixie AS signer-builder
 
 WORKDIR /build
@@ -18,13 +26,25 @@ WORKDIR /build/waa-signer
 # Match the LLVM libc++ ABI used by the published SpiderMonkey static libraries.
 RUN sed -i 's/CXX_CMD="clang++"/CXX_CMD="clang++ -stdlib=libc++"/' build.sh \
     && sed -i '/#cgo linux/ s/-lstdc++/-lc++ -lc++abi -lunwind/' internal/waa/mozjs/mozjs.go
-RUN if [ ! -f "bin/waa-signer" ] || ! file bin/waa-signer | grep -q "ELF"; then \
-        chmod +x build.sh && ./build.sh; \
-    fi
+RUN chmod +x build.sh && ./build.sh
+RUN CGO_ENABLED=1 CC=clang CXX="clang++ -stdlib=libc++" \
+    CGO_CXXFLAGS="-I/build/waa-signer/.deps/spidermonkey/linux-$(go env GOARCH)/include" \
+    CGO_LDFLAGS="-L/build/waa-signer/.deps/spidermonkey/linux-$(go env GOARCH)/lib" \
+    go test ./cmd/waa-signer
 
 # Stage 2: Runtime Python environment
 # Match the signer builder runtime ABI (Debian 13 / trixie).
 FROM python:3.11-slim-trixie
+ARG UPSTREAM_REVISION=85e22c3cf76683d470103675324c9c1f28ac6eca
+ARG CUSTOM_BUILD=fork-85e22c3-20261117
+ARG CUSTOM_REVISION=unknown
+ENV AISTUDIO_UPSTREAM_REVISION=${UPSTREAM_REVISION} \
+    AISTUDIO_CUSTOM_BUILD=${CUSTOM_BUILD} \
+    AISTUDIO_CUSTOM_REVISION=${CUSTOM_REVISION}
+LABEL org.opencontainers.image.source="https://github.com/zzz27578/aistudio-api" \
+    org.opencontainers.image.revision=${CUSTOM_REVISION} \
+    org.opencontainers.image.version=${CUSTOM_BUILD} \
+    local.aistudio.upstream-revision=${UPSTREAM_REVISION}
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -58,12 +78,13 @@ RUN chmod +x /app/waa-signer/bin/waa-signer
 
 # Copy application code and default configuration template
 COPY src/ src/
+COPY --from=web-builder /build/src/aistudio_api/static/ /app/src/aistudio_api/static/
 COPY main.py .
 COPY config.yaml /app/defaults/config.yaml
 COPY config.yaml /app/config.yaml
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 # Create necessary directories
-RUN mkdir -p /app/data /tmp
+RUN mkdir -p /app/data
 
 # Set permissions
 RUN chmod +x /app/main.py /app/docker-entrypoint.sh
@@ -72,8 +93,8 @@ RUN chmod +x /app/main.py /app/docker-entrypoint.sh
 EXPOSE 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/v1beta/models || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
 
 # Container entrypoint and default command
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

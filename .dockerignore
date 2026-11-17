@@ -39,6 +39,12 @@ docs/
 *.md
 !README.md
 
+# Rebuild the frontend; never upload local compiler output or signer binaries.
+web/*.tsbuildinfo
+src/aistudio_api/static/
+waa-signer/bin/
+waa-signer/.deps/
+
 # Development scripts
 scripts/
 

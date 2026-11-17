@@ -1,6 +1,9 @@
 # 模型管理定制部署
 
-基于主仓库 `d4c3b7957ce491e820f4c774e741c2194b5c45b5`。
+维护仓库：<https://github.com/zzz27578/aistudio-api>。
+上游基线：`85e22c3cf76683d470103675324c9c1f28ac6eca`。
+`master` 保存定制功能与上游合并结果；`custom/model-management` 保存首次迁入的定制功能，
+便于查看独立差异。更新检查仍比较 DeconstructedCube 主仓库，避免把 fork 自身的定制提交误报为上游更新。
 
 控制台 `/models` 管理从上游发现的模型。配置持久化到数据目录中的
 `model_catalog.json`，与 `config.yaml` 分离，重新拉取保留各模型的设置。
@@ -28,20 +31,26 @@
 
 ## 构建与升级
 
-`Dockerfile.model-management` 复用已验证的 `Dockerfile.deployment` 基础镜像，
-叠加新 Python 代码和由 `cd web && bun run build` 生成的静态页面。
+`Dockerfile.deployment` 从干净源码构建前端、Linux 签名器和运行镜像，不依赖服务器上的旧镜像。
+Go 阶段运行签名器离线回归测试；前端使用 Bun 锁文件安装并执行 lint、类型检查和生产构建。
+JS/CSS 使用内容哈希地址。Git 中沿用上游的静态文件，Docker 构建不会使用这些历史产物。
 
 ```sh
-docker build -f Dockerfile.model-management -t aistudio-api:upstream-d4c3b-20261116 .
+git clone https://github.com/zzz27578/aistudio-api.git
+cd aistudio-api
+# 在 .env 中设置 AISTUDIO_WEB_PASSWORD，可用 AISTUDIO_HOST_PORT 修改外部端口（默认 7878）。
+docker compose -f compose.fork.yml up -d --build
 ```
 
-升级主仓库时先将这些改动合并到新源码，重新运行 Python/前端检查并构建静态文件；
-若 Python 依赖、系统依赖或 Linux 签名器源码/构建选项变化，使用 `Dockerfile.deployment`
-构建新的基础镜像；否则可继续复用已验证的运行环境及签名器二进制。
-指定 `BASE_IMAGE`、`UPSTREAM_REVISION`、`CUSTOM_BUILD` 构建定制镜像。
-前端 JS/CSS 使用内容哈希文件名，升级时整体重建，避免新旧资源混用。
-直接拉取官方镜像会失去这些
-新增功能。不要把主仓库原始代码拷进数据目录。
+源码直接启动前，先在 `web/` 运行 `bun install --frozen-lockfile && bun run build`。
+已有部署继续保留其原 Compose、环境变量和数据挂载，升级时只更新构建来源和镜像。
+初次使用 `compose.fork.yml` 会把配置、账号和模型策略统一持久化到 `./data`。
+
+后续从 fork 拉取已合并版本可运行 `git pull --ff-only`，检查后重新构建部署。
+维护者同步上游时，使用 `git fetch upstream && git merge upstream/master`，解决冲突后运行
+AGENT.md 中的检查。同步更新 `Dockerfile.deployment` 的 `UPSTREAM_REVISION`，并用构建参数
+`CUSTOM_REVISION` 写入实际 fork commit SHA，方便核对线上来源。
+直接使用原仓库镜像会失去新增功能。不要把运行中的账号、Cookie、`.env` 或模型策略提交进 Git。
 
 升级前备份部署目录中的 `data`、`docker-compose.yml`、`.env`；保留原环境变量、账号、
 端口和数据挂载。

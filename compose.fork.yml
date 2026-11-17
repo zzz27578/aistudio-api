@@ -1,0 +1,20 @@
+services:
+  aistudio-api:
+    image: aistudio-api:fork-local
+    build:
+      context: .
+      dockerfile: Dockerfile.deployment
+    container_name: aistudio-api
+    restart: unless-stopped
+    ports:
+      - "${AISTUDIO_HOST_PORT:-7878}:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      AISTUDIO_PORT: "8080"
+      AISTUDIO_DATA_DIR: /app/data
+      AISTUDIO_ACCOUNTS_DIR: /app/data/accounts
+      AISTUDIO_CONFIG_FILE: /app/data/config.yaml
+      AISTUDIO_STATS_FILE: /app/data/stats.json
+      AISTUDIO_ROTATOR_STATE_FILE: /app/data/rotator_state.json
+      AISTUDIO_WEB_PASSWORD: "${AISTUDIO_WEB_PASSWORD:?Set AISTUDIO_WEB_PASSWORD in .env}"

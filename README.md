@@ -1,5 +1,9 @@
 # aistudio-api
 
+本 fork 增加模型启用/可见性管理、固定思考等级后缀和主仓库更新检查。
+构建、部署及同步说明见 [定制功能文档](docs/MODEL_MANAGEMENT.md)，
+Docker 部署使用 `docker compose -f compose.fork.yml up -d --build`。
+
 <p align="center">
   <a href="https://github.com/DeconstructedCube/aistudio-api"><img src="https://img.shields.io/badge/API-Gemini%20v1beta-4285F4?style=flat-square&logo=google" alt="Gemini API"></a>
   <a href="https://hub.docker.com/r/bedrockblock/aistudio-api"><img src="https://img.shields.io/badge/Docker-bedrockblock%2Faistudio--api-2496ED?style=flat-square&logo=docker" alt="Docker Hub"></a>
