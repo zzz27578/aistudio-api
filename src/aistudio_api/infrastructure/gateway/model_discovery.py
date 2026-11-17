@@ -190,6 +190,8 @@ class ModelDiscoveryService:
         self._quota_family_map: dict[str, str] = {}
         self._quota_family_members: dict[str, list[str]] = {}
         self._lock = asyncio.Lock()
+        self.source = "fallback"
+        self.refresh_error: str | None = None
 
     async def get_models(
         self,
@@ -218,6 +220,7 @@ class ModelDiscoveryService:
                 return self._cached_models
 
             # 1. 通过直接 HTTP 协议拉取
+            self.refresh_error = None
             effective_cookies = cookies
             effective_auth_user = auth_user
             effective_tier = "Free"
@@ -261,6 +264,7 @@ class ModelDiscoveryService:
                         tier=effective_tier,
                     )
                     if models:
+                        self.source = "upstream"
                         self._cached_models = models
                         self._last_fetched_at = time.time()
                         logger.info("已更新上游模型列表: count=%d", len(models))
@@ -275,6 +279,9 @@ class ModelDiscoveryService:
                         return models
                 except Exception as e:
                     logger.debug("拉取模型列表失败: %s", e)
+                self.refresh_error = "上游模型拉取失败，正在显示缓存或内置模型列表"
+            else:
+                self.refresh_error = "未配置可用账号，正在显示内置模型列表"
             if not self._cached_models:
                 self._cached_models = [dict(m) for m in _FALLBACK_MODELS]
                 self._last_fetched_at = time.time()

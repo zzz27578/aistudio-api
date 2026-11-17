@@ -1,0 +1,80 @@
+# Stage 1: Build native Go WAA signer daemon
+FROM golang:1.27-trixie AS signer-builder
+
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    clang \
+    libc++-19-dev \
+    libc++abi-19-dev \
+    libunwind-19-dev \
+    build-essential \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY waa-signer/ waa-signer/
+WORKDIR /build/waa-signer
+# Match the LLVM libc++ ABI used by the published SpiderMonkey static libraries.
+RUN sed -i 's/CXX_CMD="clang++"/CXX_CMD="clang++ -stdlib=libc++"/' build.sh \
+    && sed -i '/#cgo linux/ s/-lstdc++/-lc++ -lc++abi -lunwind/' internal/waa/mozjs/mozjs.go
+RUN if [ ! -f "bin/waa-signer" ] || ! file bin/waa-signer | grep -q "ELF"; then \
+        chmod +x build.sh && ./build.sh; \
+    fi
+
+# Stage 2: Runtime Python environment
+# Match the signer builder runtime ABI (Debian 13 / trixie).
+FROM python:3.11-slim-trixie
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    AISTUDIO_DATA_DIR=/app/data \
+    AISTUDIO_CONFIG_FILE=/app/data/config.yaml
+
+# Install runtime libraries for the native signer, HTTPS and healthchecks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libstdc++6 \
+    libc++1-19 \
+    libc++abi1-19 \
+    zlib1g \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code and default configuration template
+# Copy precompiled native WAA signer service from builder stage
+COPY --from=signer-builder /build/waa-signer/bin/waa-signer /app/waa-signer/bin/waa-signer
+RUN chmod +x /app/waa-signer/bin/waa-signer
+
+# Copy application code and default configuration template
+COPY src/ src/
+COPY main.py .
+COPY config.yaml /app/defaults/config.yaml
+COPY config.yaml /app/config.yaml
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+# Create necessary directories
+RUN mkdir -p /app/data /tmp
+
+# Set permissions
+RUN chmod +x /app/main.py /app/docker-entrypoint.sh
+
+# Expose API server port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/v1beta/models || exit 1
+
+# Container entrypoint and default command
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["python3", "main.py", "server", "--port", "8080"]

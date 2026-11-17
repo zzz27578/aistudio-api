@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { LayoutDashboard, Users, Sliders, Key, LogOut } from 'lucide-vue-next'
+import { LayoutDashboard, Users, Sliders, Key, LogOut, Boxes, Download } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth.ts'
 import { useRouter, useRoute } from 'vue-router'
 import { useSystemHealth } from '@/composables/useSystemHealth.ts'
@@ -11,6 +11,7 @@ defineProps<{
 const emit = defineEmits<{
   'update:open': [val: boolean]
   openTokenModal: []
+  openUpdateModal: []
 }>()
 
 const authStore = useAuthStore()
@@ -19,6 +20,7 @@ const route = useRoute()
 const { state: healthState } = useSystemHealth(15000)
 
 const navItems = [
+  { name: '模型', path: '/models', icon: Boxes },
   {
     name: '控制面板',
     path: '/',
@@ -97,6 +99,13 @@ function handleLogout() {
 
     <!-- Footer Status / Action -->
     <div class="p-3 border-t border-gray-100 flex flex-col gap-2">
+      <button
+        type="button"
+        class="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-medium text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer"
+        @click="emit('openUpdateModal')"
+      >
+        <Download class="w-4 h-4 text-gray-400" /><span>检查更新</span>
+      </button>
       <button
         v-if="authStore.authEnabled"
         type="button"

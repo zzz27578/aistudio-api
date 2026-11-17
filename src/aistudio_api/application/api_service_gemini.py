@@ -26,6 +26,7 @@ from aistudio_api.api.schemas import (
     GeminiCountTokensRequest,
     GeminiCreateDecisionRequest,
     GeminiGenerateContentRequest,
+    GeminiGenerationConfig,
 )
 from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_orchestrator import (
@@ -55,6 +56,7 @@ from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
+from aistudio_api.infrastructure.gateway.model_catalog import model_catalog
 from aistudio_api.infrastructure.gateway.session import SessionContext
 from aistudio_api.infrastructure.utils.logger import get_logger
 
@@ -733,6 +735,7 @@ async def handle_gemini_generate_content(
     *,
     stream: bool,
 ):
+    model_path, req = resolve_catalog_request(model_path, req)
     if stream:
         return _build_gemini_streaming_response(
             client=client, req=req, model_path=model_path
@@ -1078,7 +1081,7 @@ async def handle_gemini_decisions(
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
     raw_model = req.model or "gemini-decision-1"
-    norm_model = raw_model if raw_model.startswith("models/") else f"models/{raw_model}"
+    norm_model, _ = model_catalog.resolve(raw_model)
     questions_dict: dict[str, dict[str, object]] = {
         key: val.model_dump(mode="json", exclude_none=True)
         for key, val in req.questions.items()
@@ -1204,6 +1207,7 @@ async def handle_gemini_count_tokens(
             },
         )
 
+    model_path, effective_req = resolve_catalog_request(model_path, effective_req)
     normalized = normalize_gemini_request(effective_req, model_path)
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
@@ -1252,3 +1256,26 @@ async def handle_gemini_count_tokens(
             "type": "rate_limit_exceeded",
         },
     ) from last_error
+
+
+def resolve_catalog_request(
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+) -> tuple[str, GeminiGenerateContentRequest]:
+    resolved, level = model_catalog.resolve(model_path)
+    if level is None:
+        return resolved, req
+    config = req.generationConfig or GeminiGenerationConfig()
+    # Aliases fix the level; retain includeThoughts but discard competing budgets.
+    raw_thinking = config.thinkingConfig
+    thinking: dict[str, object] = {"thinkingLevel": level.value}
+    if isinstance(raw_thinking, dict):
+        for key in ("includeThoughts", "include_thoughts"):
+            if key in raw_thinking:
+                thinking[key] = raw_thinking[key]
+    config = config.model_copy(
+        update={"thinkingConfig": thinking, "reasoningEffort": None}
+    )
+    return resolved, req.model_copy(
+        update={"generationConfig": config, "reasoningEffort": None}
+    )

@@ -4,8 +4,10 @@ const LoginView = () => import('@/views/LoginView.vue')
 const DashboardView = () => import('@/views/DashboardView.vue')
 const AccountsView = () => import('@/views/AccountsView.vue')
 const SettingsView = () => import('@/views/SettingsView.vue')
+const ModelsView = () => import('@/views/ModelsView.vue')
 
 const routes: RouteRecordRaw[] = [
+  { path: '/models', name: 'models', component: ModelsView, meta: { title: '模型管理' } },
   {
     path: '/login',
     name: 'login',

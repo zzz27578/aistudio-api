@@ -12,6 +12,7 @@ from aistudio_api.api.response_models import (
     GeminiModelListResponse,
     GeminiModelResponse,
 )
+from aistudio_api.infrastructure.gateway.model_catalog import model_catalog
 from aistudio_api.infrastructure.utils.logger import get_logger
 
 logger = get_logger("routes.models")
@@ -80,7 +81,9 @@ async def list_models(
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
     discovered = await model_discovery.get_models(session=session)
-    models = [_to_gemini_model(item) for item in discovered]
+    models = [
+        _to_gemini_model(item) for item in model_catalog.public_models(discovered)
+    ]
     logger.debug("返回模型列表: count=%d", len(models))
     return GeminiModelListResponse(models=models)
 
@@ -93,7 +96,20 @@ async def get_model(
     session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    model_info = await model_discovery.get_model_by_id(model_id, session=session)
+    discovered = await model_discovery.get_models(session=session)
+    public = model_catalog.public_models(discovered)
+    clean = model_id.removeprefix("models/")
+    for item in public:
+        if str(item.get("id") or "").removeprefix("models/") == clean:
+            return _to_gemini_model(item)
+    resolved, level = model_catalog.resolve(model_id)
+    if level is not None:
+        raise HTTPException(status_code=404, detail="Model not found")
+    state = model_catalog.load()
+    policy = state.models.get(resolved.removeprefix("models/"))
+    if policy and not policy.visible:
+        raise HTTPException(status_code=404, detail="Model not found")
+    model_info = await model_discovery.get_model_by_id(resolved, session=session)
     if model_info is not None:
         logger.debug("返回模型详情: model=%s", model_id)
         return _to_gemini_model(model_info)

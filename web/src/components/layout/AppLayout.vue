@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import Sidebar from './Sidebar.vue'
 import Topbar from './Topbar.vue'
 import TokenSettingsModal from '@/components/modals/TokenSettingsModal.vue'
+import UpdateCheckModal from '@/components/modals/UpdateCheckModal.vue'
 import ToastContainer from '@/components/ui/ToastContainer.vue'
 import { useAccountsStore } from '@/stores/accounts.ts'
 import { useSystemStore } from '@/stores/system.ts'
@@ -16,6 +17,7 @@ const toast = useToastStore()
 
 const sidebarOpen = ref(false)
 const tokenModalOpen = ref(false)
+const updateModalOpen = ref(false)
 const refreshing = ref(false)
 
 const currentTitle = computed(() => {
@@ -49,6 +51,7 @@ async function handleRefresh() {
       :open="sidebarOpen"
       @update:open="sidebarOpen = $event"
       @open-token-modal="tokenModalOpen = true"
+      @open-update-modal="updateModalOpen = true"
     />
 
     <!-- Main Content Area -->
@@ -68,5 +71,6 @@ async function handleRefresh() {
 
     <!-- Global Token Settings Modal -->
     <TokenSettingsModal v-model="tokenModalOpen" />
+    <UpdateCheckModal v-model="updateModalOpen" />
   </div>
 </template>

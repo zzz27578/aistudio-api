@@ -31,12 +31,14 @@ from aistudio_api.infrastructure.utils.logger import (
 
 from .dependencies import require_api_key, require_web_auth
 from .routes_accounts import router as accounts_router
+from .routes_catalog import router as catalog_router
 from .routes_gemini import router as gemini_router
 from .routes_models import router as models_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
 )
+from .routes_updates import router as updates_router
 from .state import runtime_state
 
 _log_cfg = get_configured_logging_settings()
@@ -292,6 +294,8 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="AI Studio API", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
+app.include_router(catalog_router, dependencies=[Depends(require_web_auth)])
+app.include_router(updates_router, dependencies=[Depends(require_web_auth)])
 app.include_router(
     accounts_router, prefix="/api", dependencies=[Depends(require_web_auth)]
 )
