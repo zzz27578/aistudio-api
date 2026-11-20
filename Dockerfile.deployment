@@ -13,30 +13,24 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    clang \
-    libc++-19-dev \
-    libc++abi-19-dev \
-    libunwind-19-dev \
+    xz-utils \
     build-essential \
     file \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://ziglang.org/download/0.17.1/zig-$(uname -m)-linux-0.17.1.tar.xz | tar -xJ -C /opt \
+    && mv /opt/zig-* /opt/zig \
+    && ln -s /opt/zig/zig /usr/local/bin/zig
 
 COPY waa-signer/ waa-signer/
 WORKDIR /build/waa-signer
-# Match the LLVM libc++ ABI used by the published SpiderMonkey static libraries.
-RUN sed -i 's/CXX_CMD="clang++"/CXX_CMD="clang++ -stdlib=libc++"/' build.sh \
-    && sed -i '/#cgo linux/ s/-lstdc++/-lc++ -lc++abi -lunwind/' internal/waa/mozjs/mozjs.go
-RUN chmod +x build.sh && ./build.sh
-RUN CGO_ENABLED=1 CC=clang CXX="clang++ -stdlib=libc++" \
-    CGO_CXXFLAGS="-I/build/waa-signer/.deps/spidermonkey/linux-$(go env GOARCH)/include" \
-    CGO_LDFLAGS="-L/build/waa-signer/.deps/spidermonkey/linux-$(go env GOARCH)/lib" \
-    go test ./cmd/waa-signer
+# Use the upstream build/test entrypoint for the local IPC signer and its ABI.
+RUN chmod +x build.sh && ./build.sh --test && ./build.sh
 
 # Stage 2: Runtime Python environment
 # Match the signer builder runtime ABI (Debian 13 / trixie).
 FROM python:3.11-slim-trixie
-ARG UPSTREAM_REVISION=85e22c3cf76683d470103675324c9c1f28ac6eca
-ARG CUSTOM_BUILD=fork-85e22c3-20261117
+ARG UPSTREAM_REVISION=8a919084cac1bbb08307870cd5cbef07e5f09866
+ARG CUSTOM_BUILD=fork-8a91908-openai-20261120
 ARG CUSTOM_REVISION=unknown
 ENV AISTUDIO_UPSTREAM_REVISION=${UPSTREAM_REVISION} \
     AISTUDIO_CUSTOM_BUILD=${CUSTOM_BUILD} \
@@ -57,10 +51,6 @@ ENV PYTHONUNBUFFERED=1 \
 # Install runtime libraries for the native signer, HTTPS and healthchecks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libstdc++6 \
-    libc++1-19 \
-    libc++abi1-19 \
-    zlib1g \
     curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

@@ -102,8 +102,9 @@ async def get_model(
     for item in public:
         if str(item.get("id") or "").removeprefix("models/") == clean:
             return _to_gemini_model(item)
-    resolved, level = model_catalog.resolve(model_id)
-    if level is not None:
+    variant = model_catalog.resolve_variant(model_id)
+    resolved = variant.model
+    if variant.thinking_level is not None or variant.text_wrapper:
         raise HTTPException(status_code=404, detail="Model not found")
     state = model_catalog.load()
     policy = state.models.get(resolved.removeprefix("models/"))

@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
 
 from aistudio_api.api.app import app
 from aistudio_api.api.schemas import (
@@ -15,6 +14,7 @@ from aistudio_api.api.schemas import (
 from aistudio_api.application import api_service_gemini as service
 from aistudio_api.application.chat_service import normalize_gemini_request
 from aistudio_api.config import settings
+from aistudio_api.domain.models import Candidate, ModelOutput
 from aistudio_api.infrastructure.gateway.model_catalog import (
     AliasPolicy,
     ModelCatalog,
@@ -22,6 +22,7 @@ from aistudio_api.infrastructure.gateway.model_catalog import (
     ThinkingLevel,
     alias_id,
     model_catalog,
+    wrapper_alias_id,
 )
 from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
@@ -156,24 +157,33 @@ async def test_public_list_detail_and_admin_auth(monkeypatch):
 
 
 @pytest.mark.parametrize("stream", [False, True])
-async def test_alias_resolved_before_generation_entry(monkeypatch, stream):
+async def test_alias_resolved_before_account_selection_and_signing(monkeypatch, stream):
     model_catalog.update(BASE, enabled_aliases())
-    seen = []
-
-    def capture(client, req, model_path):
-        seen.append((model_path, normalize_gemini_request(req, model_path)))
-        return StreamingResponse(iter([]))
-
-    async def capture_async(model_path, req, client):
-        return capture(client, req, model_path)
-
-    monkeypatch.setattr(service, "_build_gemini_streaming_response", capture)
-    monkeypatch.setattr(service, "_do_generate_content", capture_async)
-    await service.handle_gemini_generate_content(
-        alias_id(BASE, ThinkingLevel.LOW), request(), MagicMock(), stream=stream
+    ensure = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, "ensure_active_account", ensure)
+    client = MagicMock()
+    client.prepare_request = AsyncMock(return_value=MagicMock(ctx=None))
+    client.generate_content = AsyncMock(
+        return_value=ModelOutput(candidates=[Candidate(text="answer", finish_reason=1)])
     )
-    assert seen[0][0] == f"models/{BASE}"
-    assert seen[0][1].generation_config_overrides["thinking_config"] == [
+
+    async def events(**kwargs):
+        yield "body", "answer"
+        yield "finish_reason", 1
+        yield "done", None
+
+    client.stream_generate_content = events
+    name = alias_id(BASE, ThinkingLevel.LOW)
+    if stream:
+        assert [
+            item async for item in service.stream_generation(name, request(), client)
+        ]
+    else:
+        await service.run_generation(name, request(), client)
+    ensure.assert_awaited_once_with(0, model=f"models/{BASE}")
+    prepared = client.prepare_request.call_args.kwargs
+    assert prepared["model"] == f"models/{BASE}"
+    assert prepared["generation_config_overrides"]["thinking_config"] == [
         1,
         None,
         None,
@@ -214,3 +224,90 @@ def test_corrupt_settings_fail_closed(tmp_path):
         model_catalog.resolve(BASE)
     assert error.value.status_code == 503
     assert path.read_text(encoding="utf-8") == "broken"
+
+
+def test_wrapper_aliases_are_independent_persistent_and_policy_gated():
+    model_catalog.update(
+        BASE,
+        ModelPolicy(
+            visible=False,
+            text_wrapper=AliasPolicy(enabled=True),
+            wrapper_thinking_aliases={
+                ThinkingLevel.HIGH: AliasPolicy(enabled=True, visible=False),
+                ThinkingLevel.LOW: AliasPolicy(enabled=True),
+            },
+        ),
+    )
+    restarted = ModelCatalog()
+    basic = restarted.resolve_variant(wrapper_alias_id(BASE))
+    assert basic.model == f"models/{BASE}"
+    assert basic.thinking_level is None
+    assert basic.text_wrapper
+    combined = restarted.resolve_variant(wrapper_alias_id(BASE, ThinkingLevel.HIGH))
+    assert combined.thinking_level == ThinkingLevel.HIGH
+    assert combined.text_wrapper
+    assert [item["id"] for item in restarted.public_models(MODELS)] == [
+        wrapper_alias_id(BASE),
+        wrapper_alias_id(BASE, ThinkingLevel.LOW),
+    ]
+    with pytest.raises(HTTPException) as error:
+        restarted.resolve(wrapper_alias_id(BASE))
+    assert error.value.status_code == 400
+    with pytest.raises(HTTPException) as error:
+        restarted.resolve(alias_id(BASE, ThinkingLevel.HIGH))
+    assert error.value.status_code == 404
+    model_catalog.update(BASE, ModelPolicy(enabled=False))
+    with pytest.raises(HTTPException) as error:
+        restarted.resolve_variant(wrapper_alias_id(BASE, ThinkingLevel.HIGH))
+    assert error.value.status_code == 403
+
+
+def test_wrapper_unsupported_models_and_disappearing_levels_fail_closed():
+    model_catalog.update(
+        BASE,
+        ModelPolicy(
+            wrapper_thinking_aliases={ThinkingLevel.HIGH: AliasPolicy(enabled=True)}
+        ),
+    )
+    model_catalog.sync([{**MODELS[0], "thinkingLevels": [1]}])
+    with pytest.raises(HTTPException) as error:
+        model_catalog.resolve_variant(wrapper_alias_id(BASE, ThinkingLevel.HIGH))
+    assert error.value.status_code == 400
+    model_catalog.sync([{**MODELS[0], "is_image_model": True}])
+    with pytest.raises(HTTPException) as error:
+        model_catalog.update(BASE, ModelPolicy(text_wrapper=AliasPolicy(enabled=True)))
+    assert error.value.status_code == 400
+    assert all(
+        not item.get("textWrapper")
+        for item in model_catalog.public_models([{**MODELS[0], "is_image_model": True}])
+    )
+
+
+def test_wrapper_alias_conflicts_do_not_shadow_real_upstream_names():
+    metadata = [{**MODELS[0], "aliases": [wrapper_alias_id(BASE)]}]
+    model_catalog.sync(metadata)
+    with pytest.raises(HTTPException) as error:
+        model_catalog.update(BASE, ModelPolicy(text_wrapper=AliasPolicy(enabled=True)))
+    assert error.value.status_code == 400
+    variant = model_catalog.resolve_variant(wrapper_alias_id(BASE))
+    assert variant.model == f"models/{BASE}"
+    assert not variant.text_wrapper
+
+
+async def test_wrapper_catalog_contract_and_hidden_metadata(monkeypatch):
+    model_catalog.update(
+        BASE, ModelPolicy(text_wrapper=AliasPolicy(enabled=True, visible=False))
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/model-catalog")
+        assert response.status_code == 200
+        entry = response.json()["models"][0]
+        assert entry["supports_text_wrapper"] is True
+        assert entry["wrapper_alias"] == wrapper_alias_id(BASE)
+        assert entry["wrapper_thinking_aliases"]["HIGH"] == wrapper_alias_id(
+            BASE, ThinkingLevel.HIGH
+        )
+        response = await client.get(f"/v1beta/models/{wrapper_alias_id(BASE)}")
+        assert response.status_code == 404

@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import json
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 
 from aistudio_api.domain.errors import (
     RequestError,
@@ -80,6 +81,7 @@ class StreamingGateway:
         body_started = False
         inline_thought_buf = ""
         pending_text_sig: str | None = None
+        has_complete_tool_call = False
 
         def _flush_inline_thought_prefix(
             chunk_text: str, text_sig: str = ""
@@ -124,8 +126,11 @@ class StreamingGateway:
 
         def emit_parsed_chunk(
             parsed_chunk: list[object],
+            *,
+            repaired: bool = False,
         ) -> list[tuple[str, object | None]]:
             nonlocal latest_usage, latest_finish_reason, latest_response_id
+            nonlocal has_complete_tool_call
             events: list[tuple[str, object | None]] = []
             usage = parse_chunk_usage(parsed_chunk)
             if usage:
@@ -139,9 +144,14 @@ class StreamingGateway:
                 latest_response_id = str(parsed_chunk[WIRE_RESPONSE_ID_INDEX])
                 events.append(("response_id", latest_response_id))
             candidate = parse_response_chunk(parsed_chunk)
-            if candidate.finish_reason is not None and candidate.finish_reason not in (
-                0,
-                WIRE_FINISH_REASON_CONTINUING,
+            if (
+                not repaired
+                and candidate.finish_reason is not None
+                and candidate.finish_reason
+                not in (
+                    0,
+                    WIRE_FINISH_REASON_CONTINUING,
+                )
             ):
                 latest_finish_reason = candidate.finish_reason
             if candidate.thinking:
@@ -150,7 +160,8 @@ class StreamingGateway:
                 events.append(("thinking", candidate.thinking))
             if candidate.reasoning_images:
                 events.append(("reasoning_images", candidate.reasoning_images))
-            if candidate.function_calls:
+            if candidate.function_calls and not repaired:
+                has_complete_tool_call = True
                 events.append(("tool_calls", candidate.function_calls))
             if candidate.images:
                 events.append(("images", candidate.images))
@@ -166,37 +177,40 @@ class StreamingGateway:
                 events.append(("thought_signature", candidate.standalone_signature))
             return events
 
-        async for event_type, payload in self._session.send_streaming_request(
-            body=request_body,
-            url=request.url,
-            headers=request.headers,
-            ctx=request.ctx,
-        ):
-            if event_type == "error":
-                err_msg = (
-                    str(payload).strip()
-                    if payload
-                    else "unknown streaming transport error"
-                )
-                raise TransportError(f"Streaming request failed: {err_msg}")
-            if event_type == "status" and payload and not status_code:
-                status_code = int(str(payload))
-            elif event_type == "chunk" and payload:
-                has_received_chunks = True
-                if isinstance(payload, bytes):
-                    text_payload = utf8_decoder.decode(payload, final=False)
-                else:
-                    text_payload = str(payload)
-                if not text_payload:
-                    continue
-                if status_code != 200:
-                    raw_parts.append(text_payload)
-                elif len(head_sample) < 512:
-                    head_sample += text_payload[: 512 - len(head_sample)]
-                for parsed_chunk in parser.feed(text_payload):
-                    for event in emit_parsed_chunk(parsed_chunk):
-                        emitted_any_chunk = True
-                        yield event
+        async with aclosing(
+            self._session.send_streaming_request(
+                body=request_body,
+                url=request.url,
+                headers=request.headers,
+                ctx=request.ctx,
+            )
+        ) as events:
+            async for event_type, payload in events:
+                if event_type == "error":
+                    err_msg = (
+                        str(payload).strip()
+                        if payload
+                        else "unknown streaming transport error"
+                    )
+                    raise TransportError(f"Streaming request failed: {err_msg}")
+                if event_type == "status" and payload and not status_code:
+                    status_code = int(str(payload))
+                elif event_type == "chunk" and payload:
+                    has_received_chunks = True
+                    if isinstance(payload, bytes):
+                        text_payload = utf8_decoder.decode(payload, final=False)
+                    else:
+                        text_payload = str(payload)
+                    if not text_payload:
+                        continue
+                    if status_code != 200:
+                        raw_parts.append(text_payload)
+                    elif len(head_sample) < 512:
+                        head_sample += text_payload[: 512 - len(head_sample)]
+                    for parsed_chunk in parser.feed(text_payload):
+                        for event in emit_parsed_chunk(parsed_chunk):
+                            emitted_any_chunk = True
+                            yield event
         trailing_text = utf8_decoder.decode(b"", final=True)
         if trailing_text:
             if status_code != 200:
@@ -206,8 +220,13 @@ class StreamingGateway:
                     emitted_any_chunk = True
                     yield event
 
+        # Repair can salvage received text, but must not turn a broken response
+        # into a successful STOP. A complete envelope, explicit terminal or a
+        # fully received tool call provides independent completion evidence.
+        incomplete_json = parser.depth != 0 or parser.in_string
+        incomplete_chunk = parser.chunk_start is not None
         for parsed_chunk in parser.finish():
-            for event in emit_parsed_chunk(parsed_chunk):
+            for event in emit_parsed_chunk(parsed_chunk, repaired=True):
                 emitted_any_chunk = True
                 yield event
         if inline_thought_buf or pending_text_sig:
@@ -251,6 +270,16 @@ class StreamingGateway:
                 raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
             if is_html_payload(head_sample):
                 raise TransportError("upstream returned HTML error page on HTTP 200")
+        if incomplete_chunk or (
+            latest_finish_reason is None
+            and (
+                not emitted_any_chunk
+                or (incomplete_json and not has_complete_tool_call)
+            )
+        ):
+            raise TransportError(
+                "upstream response ended without a complete envelope or terminal result"
+            )
         if latest_finish_reason is not None:
             yield ("finish_reason", latest_finish_reason)
         else:

@@ -6,6 +6,8 @@ export interface ModelPolicy {
   enabled: boolean
   visible: boolean
   thinking_aliases: Partial<Record<ThinkingLevel, AliasPolicy>>
+  text_wrapper: AliasPolicy
+  wrapper_thinking_aliases: Partial<Record<ThinkingLevel, AliasPolicy>>
 }
 export interface CatalogModel {
   id: string
@@ -21,6 +23,9 @@ export interface CatalogModel {
   policy: ModelPolicy
   supported_levels: ThinkingLevel[]
   aliases: Record<ThinkingLevel, string>
+  supports_text_wrapper: boolean
+  wrapper_alias: string
+  wrapper_thinking_aliases: Record<ThinkingLevel, string>
 }
 export interface CatalogResponse {
   models: CatalogModel[]

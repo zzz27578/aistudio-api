@@ -57,8 +57,12 @@ async def test_get_config_endpoint():
         assert resp.status_code == 200
         data = resp.json()
         assert "port" in data
-        assert "proof_server_url" in data
+        assert data["signer_mode"] == "local_ipc"
+        assert "signer_ready" in data
         assert "yaml_content" in data
+
+        removed = await client.get("/config/signer-servers")
+        assert removed.status_code == 404
 
 
 @pytest.mark.asyncio

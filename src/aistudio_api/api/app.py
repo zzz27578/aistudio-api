@@ -34,6 +34,7 @@ from .routes_accounts import router as accounts_router
 from .routes_catalog import router as catalog_router
 from .routes_gemini import router as gemini_router
 from .routes_models import router as models_router
+from .routes_openai import router as openai_router
 from .routes_system import (
     protected_router as system_protected_router,
     public_router as system_public_router,
@@ -53,9 +54,8 @@ async def lifespan(_app: FastAPI):
         stop_signer_daemon,
     )
 
-    # 启动时自动检查并拉起本地 WAA 签名服务（若配置为本地节点）
-    ensure_signer_ready()
-
+    # 启动时预热本地 WAA IPC 签名子进程
+    await ensure_signer_ready()
     from aistudio_api.application.account_rotator import init_rotator
     from aistudio_api.application.account_service import AccountService
     from aistudio_api.infrastructure.account.account_store import AccountStore
@@ -285,13 +285,13 @@ async def lifespan(_app: FastAPI):
             await client.close()
         except Exception as e:
             logger.debug("关闭客户端异常: %s", e)
-    stop_signer_daemon()
+    await stop_signer_daemon()
     runtime_state.client = None
     runtime_state.account_service = None
     runtime_state.rotator = None
 
 
-app = FastAPI(title="AI Studio API", lifespan=lifespan)
+app = FastAPI(title="AI Studio API", version="0.2.0", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(catalog_router, dependencies=[Depends(require_web_auth)])
@@ -302,10 +302,16 @@ app.include_router(
 app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
 app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
 app.include_router(models_router, dependencies=[Depends(require_api_key)])
+app.include_router(openai_router, dependencies=[Depends(require_api_key)])
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    if _request.url.path.startswith("/v1/"):
+        from aistudio_api.application.api_service_openai import openai_error_payload
+
+        status, payload = openai_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload, headers=exc.headers)
     code, msg, status_str = classify_gemini_error_payload(exc)
     if code >= 500:
         logger.error(
@@ -345,6 +351,11 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
 async def validation_exception_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
+    if _request.url.path.startswith("/v1/"):
+        from aistudio_api.application.api_service_openai import openai_error_payload
+
+        status, payload = openai_error_payload(exc)
+        return JSONResponse(status_code=status, content=payload)
     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
     logger.warning("请求参数校验失败: path=%s, error=%s", _request.url.path, exc)
     return JSONResponse(
@@ -593,6 +604,7 @@ async def spa_navigation_middleware(request: Request, call_next):
         (
             "/api",
             "/v1beta",
+            "/v1/",
             "/auth",
             "/assets",
             "/static",

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from contextlib import aclosing
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -184,11 +186,14 @@ class AIStudioClient:
             generation_config_overrides=generation_config_overrides,
             force_recreate_signer=force_recreate_signer,
         )
-        async for event in self._streaming_gateway.stream_chat(
-            request=effective_prep,
-            model=model,
-        ):
-            yield event
+        async with aclosing(
+            self._streaming_gateway.stream_chat(
+                request=effective_prep,
+                model=model,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def generate_content(
         self,
@@ -241,25 +246,34 @@ class AIStudioClient:
             raise SessionExpiredError("登录态已失效: 被重定向至 Google 登录页")
         if is_html_payload(raw_text):
             raise TransportError("upstream returned HTML error page on HTTP 200")
+        payload = raw_text.strip()
+        if payload.startswith(")]}'"):
+            payload = payload[4:].lstrip()
+        try:
+            envelope: object = json.loads(payload)
+        except json.JSONDecodeError:
+            raise TransportError("incomplete generation JSON response") from None
+        if not isinstance(envelope, list):
+            raise TransportError("generation response is not a JSON array")
         output = parse_text_output(raw_text)
+        if not output.candidates:
+            raise TransportError(
+                "generation response contained no candidate or terminal result"
+            )
+        for candidate in output.candidates:
+            if candidate.finish_reason is None:
+                if not candidate.has_content and not candidate.thinking:
+                    raise TransportError(
+                        "generation response contained no content or terminal result"
+                    )
+                # A fully decoded envelope is completion evidence even when
+                # this wire variant omits its candidate finish enum.
+                candidate.finish_reason = 1
         output.model = model
         return output
 
     def _build_upstream_headers(self, ctx: SessionContext) -> dict[str, str]:
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
         headers = dict(DEFAULT_UPSTREAM_HEADERS)
-        if active_waa.get("user_agent"):
-            merge_header_case_insensitive(
-                headers, "User-Agent", str(active_waa["user_agent"])
-            )
-        server_hdrs = active_waa.get("headers")
-        if isinstance(server_hdrs, dict):
-            for k, v in server_hdrs.items():
-                merge_header_case_insensitive(headers, str(k), str(v))
         dyn_headers: object = None
         get_ctx_headers = getattr(self._session, "get_signer_headers", None)
         if callable(get_ctx_headers):

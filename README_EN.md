@@ -1,5 +1,7 @@
 # aistudio-api
 
+This fork provides both Gemini and OpenAI Chat Completions APIs, model availability/discovery controls, fixed thinking aliases, experimental `-抗截断` text aliases, bulk card controls and upstream update checks. See [fork documentation](docs/MODEL_MANAGEMENT.md).
+
 <p align="center">
   <a href="https://github.com/DeconstructedCube/aistudio-api"><img src="https://img.shields.io/badge/API-Gemini%20v1beta-4285F4?style=flat-square&logo=google" alt="Gemini API"></a>
   <a href="https://hub.docker.com/r/bedrockblock/aistudio-api"><img src="https://img.shields.io/badge/Docker-bedrockblock%2Faistudio--api-2496ED?style=flat-square&logo=docker" alt="Docker Hub"></a>
@@ -54,8 +56,8 @@
 | **Downstream Parameter Fault Tolerance** | `drop_unsupported_params` automatically drops unsupported safety categories (e.g. `HARM_CATEGORY_CIVIC_INTEGRITY`) and tools to prevent 400 errors |
 | **Multi-Account Probing** | Extracts and verifies sub-accounts (`u/0`, `u/1`...) automatically when importing a multi-session Cookie |
 | **Built-in Tools** | Supports official tools such as Google Search, Google Maps, URL Context, and Code Execution sandbox |
-| **Dual-Track Signing & Feature Alignment** | Browserless architecture supporting standalone Go signer (SpiderMonkey 152) or remote NodeVM signers with matched User-Agent/header binding and 5-stage 403 recovery |
-| **Web Management Console** | Built-in web dashboard for account management (groups, presets, text/JSON bundle imports), live request metrics, WAA signer switching, logging/dump controls, and `config.yaml` hot reloading |
+| **Local WAA IPC Signing** | Browserless architecture powered by local Go `waa-signer` (SpiderMonkey 152) over multiplexed stdio NDJSON IPC, aligned with Firefox 152 User-Agent/headers and 5-stage 403 recovery |
+| **Web Management Console** | Built-in web dashboard for account management (groups, presets, text/JSON bundle imports), live request metrics, logging/dump controls, and `config.yaml` hot reloading |
 > [!NOTE]
 > **Memory Footprint**: Operating completely browserless, resident memory is only ~35 - 50 MB with sub-second cold start, running smoothly even on lightweight mobile Termux environments or entry-level servers.
 ## Architecture & Documentation
@@ -73,8 +75,7 @@
 └───────────────────────────┼────────────────────────────┘
                             │ Proof Mint & HTTP/2 Stream
 ┌───────────────────────────▼────────────────────────────┐
-│       Browserless WAA Engine (waa-signer / Remote NodeVM)     │
-│       Async Connection Pooling (HTTPStreamTransport)   │
+│       Browserless WAA Engine (waa-signer via stdio IPC)│
 └───────────────────────────┬────────────────────────────┘
                             │ HTTPS / RPC
 ┌───────────────────────────▼────────────────────────────┐
@@ -94,82 +95,42 @@ Technical reference documentation:
 
 ## Quick Start
 
-> [!NOTE]
-> **Out-of-the-Box Operation**: The service comes pre-configured with a remote WAA proof signing node. Once dependencies are installed, **start the server directly without compilation**! For offline operation or ultra-fast 10-30 ms local performance, compile the native engine at any time (see the optional advanced guides below).
+Except for Docker, all native platforms use a unified one-command installer and launcher that automatically configures Python 3.11+, `uv`, Go, Zig, SpiderMonkey static libraries, and builds `waa-signer`.
+
 ### Android (Termux)
 
 > [!TIP]
 > **Download Notice**: Always install Termux from [F-Droid](https://f-droid.org/packages/com.termux/) or [GitHub Releases](https://github.com/termux/termux-app/releases). **Do NOT install from the Google Play Store** (the Play Store build is obsolete and will produce repository update errors).
 
-Open Termux and run the following commands step by step:
+Open Termux and run:
 
 ```bash
-# Step 1: Update Termux environment and install git
 pkg update -y && pkg install -y git
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Initialize Python environment & sync dependencies
-bash scripts/setup-env.sh
-uv sync
-
-# Step 4: Start server (out-of-the-box)
-uv run python main.py server --port 8080
+bash install.sh
+bash start.sh
 ```
-
-<details>
-<summary><b>[Optional Advanced] Build local native signer service (waa-signer)</b></summary>
-
-To operate completely offline with 10-30 ms local proof minting:
-```bash
-pkg install -y golang zig
-bash waa-signer/build.sh
-```
-Restart the service upon build completion; it will automatically detect and switch to the local native engine.
-</details>
 
 Once started:
 1. Open your phone's browser and go to **`http://localhost:8080`** to access the Web Console;
 2. Follow the [Cookie Import Guide](#obtaining--importing-account-credentials-cookies) below to import your credentials;
-3. **Background Persistence Tip**: Pull down Android's notification bar, tap `Acquire Wakelock` on Termux's notification, and disable battery optimization for Termux in phone system settings to prevent sleep kills.
+3. **Background Persistence Tip**: Pull down Android's notification bar, tap `Acquire Wakelock` on Termux's notification, and disable battery optimization for Termux in phone system settings.
+
 ---
 
 ### Windows
 
-Recommended: [Git](https://git-scm.com/) installed. Python environments are automatically managed by `uv`.
+Recommended: [Git](https://git-scm.com/) installed (or download and extract the repository ZIP).
 
-Open PowerShell or Windows Terminal:
+Double-click **`install.bat`** (or run `.\install.bat`) to set up dependencies and compile `waa-signer.exe` automatically, then double-click **`start.bat`** (or run `.\start.bat`) to launch:
 
 ```bat
-# Step 1: Install uv package manager
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Sync dependencies (uv downloads required Python automatically)
-uv sync
-
-# Step 4: Start server (out-of-the-box)
-uv run python main.py server --port 8080
+.\install.bat
+.\start.bat
 ```
-
-<details>
-<summary><b>[Optional Advanced] Build local native signer service (waa-signer.exe)</b></summary>
-
-To enable the local native proof engine:
-```powershell
-# Recommended compiler install (the script also guides automatic install):
-winget install GoLang.Go zig.zig
-
-# Run build script
-.\waa-signer\build.bat
-```
-Restart the service upon completion.
-</details>
 
 Open **`http://localhost:8080`** in your browser to access the Web Console.
 
@@ -177,33 +138,17 @@ Open **`http://localhost:8080`** in your browser to access the Web Console.
 
 ### Linux / macOS
 
-Open a terminal and run:
-
 ```bash
-# Step 1: Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Step 2: Clone repository and enter directory
 git clone https://github.com/DeconstructedCube/aistudio-api.git
 cd aistudio-api
-
-# Step 3: Sync dependencies
-uv sync
-
-# Step 4: Start server (out-of-the-box)
-uv run python3 main.py server --port 8080
+bash install.sh
+bash start.sh
 ```
 
-<details>
-<summary><b>[Optional Advanced] Build local native signer service</b></summary>
-
-Prerequisite: Go 1.22+ and zig (or clang / gcc):
-```bash
-bash waa-signer/build.sh
-```
-</details>
+> Useful flags: `bash install.sh --start` (launch right after build), `bash install.sh --proxy http://127.0.0.1:7890`, `bash install.sh --rebuild`.
 
 Open **`http://localhost:8080`** in your browser to access the Web Console.
+
 ---
 
 ### Docker Deployment
@@ -251,13 +196,13 @@ This service does not store your Google account password. It uses standard web s
 
 ## Third-Party Client Setup Guide (NextChat / Cherry Studio / One API)
 
-> [!WARNING]
-> **Strictly Gemini Protocol Required**!
-> This project is a dedicated reverse proxy strictly adhering to the Google Gemini API specification. It **does NOT provide OpenAI-compatible routes** (such as `/v1/chat/completions`). In all third-party clients, you MUST select **Google Gemini** (or **Gemini**) as the model provider type.
+Both protocols are enabled on the same port. For an OpenAI-compatible client, use base URL `http://localhost:8080/v1` with `/v1/models` and `/v1/chat/completions`. Gemini clients keep the configuration below. Both share API keys, accounts, quota and model policies.
+
+OpenAI compatibility covers chat, SSE, image inputs, reasoning and function calls; it does not provide Responses, Images, Audio or Embeddings endpoints. Native Gemini image generation remains available. Experimental `-抗截断` aliases buffer text and cannot be combined with external tools, structured output or multimodal input; they do not guarantee complete output or automatically continue interrupted answers.
 
 | Setting | Value | Description |
 |---|---|---|
-| **Provider / Model Type** | **Google Gemini** | Do NOT select OpenAI or custom OpenAI formats |
+| **Provider / Model Type** | **Google Gemini** | Native protocol; use the OpenAI configuration above for compatible clients |
 | **API Base URL** | `http://localhost:8080` | If the client mandates a version prefix, enter `http://localhost:8080/v1beta` |
 | **API Key** | Any string (e.g. `aistudio-api`) | If `api_keys` is not set in `config.yaml`, any non-empty string works; otherwise enter your configured key |
 | **Supported Models** | `gemini-3.7-flash`<br/>`gemini-3.8-flash`<br/>`gemini-4-argon`<br/>`gemini-3.1-flash-image` | Supports all active models discovered dynamically from Google AI Studio |
@@ -279,7 +224,6 @@ Open `http://localhost:8080` in your browser to access the Web Console.
 | `AISTUDIO_CONFIG_FILE` | string | `config.yaml` | Path to model rules and default tools configuration YAML |
 | `AISTUDIO_PERSIST_STATS` | bool | `true` | Persist request and token usage metrics across service restarts |
 | `AISTUDIO_PERSIST_ROTATOR` | bool | `true` | Persist account 429 rate limit dates & cooldowns across restarts |
-| `AISTUDIO_PROOF_SERVER_URL` | string | `https://waa.spinsnow.fun` | Fallback proof server URL; active signer & bound User-Agent are primarily configured in `config.yaml` (`waa.active_server`, falling back to `remote_spinsnow` if local binary is absent) |
 | `AISTUDIO_DEFAULT_TEXT_MODEL` | string | `gemini-3.7-flash` | Default text model |
 | `AISTUDIO_TIMEZONE` | string | Auto | Wire protocol timezone (`America/Los_Angeles` by default) |
 | `AISTUDIO_DUMP_REQUESTS` | bool | `false` | Dump API request/response exchanges to console logs (enabled via `DEBUG=1`) |
@@ -435,7 +379,7 @@ The service includes a built-in static Web Console served at `http://localhost:8
 
 - **Dashboard**: Real-time view of service health, per-model request stats, success rates, and rate-limit cooldown status.
 - **Accounts**: Import Cookie credentials (single text or bundle files), auto-probe multiple accounts, organize groups and one-click presets, switch the active account, or reset rate limits.
-- **Settings**: Online editor for `config.yaml` with instant hot-reloading, manual WAA signer server switching, API key management, and dynamic log/dump settings.
+- **Settings**: Online editor for `config.yaml` with instant hot-reloading, local WAA IPC signer status, API key management, and dynamic log/dump settings.
 - **Access Control**: Enable authentication by setting `AISTUDIO_WEB_PASSWORD`.
 
 ---
@@ -459,10 +403,11 @@ Python quality checks and tests:
 # Run code style & lint check
 uv run ruff check .
 # Run static type checking
-bun x pyright src tests
-
-# Run test suite
+uv tool run pyright src tests
+# Run Python test suite
 uv run pytest
+# Run Go WAA signer unit tests
+bash waa-signer/build.sh --test
 ```
 
 ---

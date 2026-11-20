@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import itertools
 import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 
 from aistudio_api.config import settings
@@ -65,16 +65,7 @@ class GatewaySession:
         self._signing_locks: dict[str, asyncio.Lock] = {}
         self._context_signer_headers: dict[str, dict[str, str]] = {}
         self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        server_url = str(active_waa.get("url") or settings.proof_server_url)
-        self._signer = WaaSigner(
-            proof_server_url=server_url,
-            proxy_url=settings.proxy_url,
-        )
+        self._signer = WaaSigner()
 
     @property
     def is_ready(self) -> bool:
@@ -215,21 +206,6 @@ class GatewaySession:
         force_recreate: bool = False,
     ) -> str:
         """仅供已持有账号签名锁的当前代际调用。"""
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        target_url = str(active_waa.get("url") or "").rstrip("/")
-        remote = getattr(self._signer, "_remote_signer", None)
-        if remote and target_url and getattr(remote, "server_url", None) != target_url:
-            close_fn = getattr(self._signer, "close", None)
-            if callable(close_fn):
-                res = close_fn()
-                if inspect.isawaitable(res):
-                    await res
-            remote.server_url = target_url
-
         if not self.is_context_current(active_ctx):
             raise StaleSessionError("签名前凭据代际已更新")
         if active_ctx.auth_file:
@@ -396,17 +372,20 @@ class GatewaySession:
         req_headers = self.build_request_headers(
             headers, auth_user=active_ctx.auth_user
         )
-        async for event in self._transport.send_streaming_request(
-            url=target_url,
-            headers=req_headers,
-            body=body,
-            auth_user=active_ctx.auth_user,
-            tier=active_ctx.tier,
-            auth_file=active_ctx.auth_file,
-            cookies=active_ctx.cookies,
-            expected_cookie_id=active_ctx.cookie_id,
-        ):
-            yield event
+        async with aclosing(
+            self._transport.send_streaming_request(
+                url=target_url,
+                headers=req_headers,
+                body=body,
+                auth_user=active_ctx.auth_user,
+                tier=active_ctx.tier,
+                auth_file=active_ctx.auth_file,
+                cookies=active_ctx.cookies,
+                expected_cookie_id=active_ctx.cookie_id,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""

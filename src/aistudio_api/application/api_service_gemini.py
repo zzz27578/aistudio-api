@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from pathlib import Path
+from typing import Literal
 
+from anyio import CancelScope
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from aistudio_api.api.response_models import (
     GeminiCandidateResponse,
@@ -39,7 +43,15 @@ from aistudio_api.application.chat_service import (
     NormalizedGeminiRequest,
     normalize_gemini_request,
 )
+from aistudio_api.application.stream_lifecycle import with_sse_keepalive
+from aistudio_api.application.text_wrapper import (
+    TextWrapperStream,
+    unwrap_text_output,
+    wrap_text_request,
+)
 from aistudio_api.domain.errors import (
+    AccountRestrictedError,
+    AccountVerificationRequiredError,
     AistudioError,
     AuthError,
     RequestError,
@@ -51,6 +63,7 @@ from aistudio_api.domain.errors import (
     is_transport_error,
     parse_upstream_grpc_error,
 )
+from aistudio_api.domain.models import ModelOutput
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
@@ -63,14 +76,23 @@ from aistudio_api.infrastructure.utils.logger import get_logger
 logger = get_logger("api.gemini")
 
 
+def _request_context_snapshot(client: AIStudioClient) -> SessionContext:
+    """在签名前绑定本次账号，未知来源用空上下文阻止回退到新活跃账号。"""
+    session = getattr(client, "session", None)
+    context = getattr(session, "active_context", None) if session is not None else None
+    return context if isinstance(context, SessionContext) else SessionContext()
+
+
 def _request_account(
     request_ctx: SessionContext | None,
 ) -> tuple[AccountMeta | None, str | None]:
-    """按本次请求的凭据路径确定账号，缺少上下文时保留兼容行为。"""
+    """按本次请求凭据定位账号，显式未知来源不能落到新的全局账号。"""
     account_svc = runtime_state.account_service
     if account_svc is None:
         return None, None
-    if request_ctx is not None and request_ctx.auth_file:
+    if request_ctx is not None:
+        if not request_ctx.auth_file:
+            return None, None
         account_id = Path(request_ctx.auth_file).parent.name
         return account_svc.get_account(account_id), account_id
     account = account_svc.get_active_account()
@@ -89,14 +111,51 @@ def _is_request_generation_current(request_ctx: SessionContext | None) -> bool:
     )
 
 
-def _record_request_auth_error(model: str, request_ctx: SessionContext | None) -> None:
-    """将认证处罚记到实际请求账号，避免并发切号后的全局账号错归因。"""
+def _record_request_rotator_event(
+    event: Literal["auth_error", "rate_limited", "error", "success"],
+    *,
+    model: str,
+    request_ctx: SessionContext | None,
+    usage: dict[str, object] | None = None,
+) -> None:
+    """只记录本次请求的当前代际账号，未知或已删除来源不影响新活跃账号。"""
     if request_ctx is None:
-        record_rotator_event("auth_error", model=model)
+        record_rotator_event(event, model=model, usage=usage)
         return
-    _, account_id = _request_account(request_ctx)
-    if account_id and runtime_state.rotator is not None:
-        runtime_state.rotator.record_auth_error(account_id, model=model)
+    if not request_ctx.auth_file:
+        return
+    account, account_id = _request_account(request_ctx)
+    rotator = runtime_state.rotator
+    if (
+        account is None
+        or account_id is None
+        or rotator is None
+        or not _is_request_generation_current(request_ctx)
+    ):
+        return
+    record_rotator_event(event, model=model, usage=usage, account_id=account_id)
+
+
+def _is_prepared_binding_current(prepared: PreparedRequest) -> bool:
+    """重放缓存签名时核对账户启用状态、代际、登录索引与订阅权益。"""
+    account_svc = runtime_state.account_service
+    if account_svc is None:
+        return True
+    ctx = prepared.ctx
+    account = account_svc.get_active_account()
+    if (
+        ctx is None
+        or not ctx.auth_file
+        or account is None
+        or not account.enabled
+        or Path(ctx.auth_file).parent.name != account.id
+        or not _is_request_generation_current(ctx)
+        or ctx.auth_user != account.auth_user
+    ):
+        return False
+    from aistudio_api.infrastructure.account.cookie_parser import normalize_benefit_tier
+
+    return normalize_benefit_tier(ctx.tier) == normalize_benefit_tier(account.tier)
 
 
 async def _prepare_content_request(
@@ -108,8 +167,10 @@ async def _prepare_content_request(
     ctx: SessionContext | None = None,
 ) -> PreparedRequest:
     """显式持有本次签名快照，普通与流式请求共用相同的上下文绑定。"""
-    if prepared is not None:
-        return prepared
+    if prepared is not None and not force_recreate_signer:
+        if _is_prepared_binding_current(prepared):
+            return prepared
+        logger.info("缓存签名的账户绑定已变化，重新准备请求")
     if isinstance(ctx, SessionContext):
         return await client.prepare_request(
             model=normalized.model,
@@ -153,7 +214,7 @@ SHORT_RATE_LIMIT_COOLDOWN_SECONDS = 600
 class Auth403RetryManager:
     """403 阶梯重试管理器：前 2 次重放，后 2 次重新签名，最后 1 次切号。
 
-    force_recreate_signer 用于通知本地/远程签名服务销毁僵死热 Worker 冷重建，
+    force_recreate_signer 用于通知本地 WAA IPC 签名器销毁僵死热 Worker 冷重建，
     由处理入口在当次请求中消费后立即归零，避免重复触发昂贵的冷启动。
     """
 
@@ -164,15 +225,47 @@ class Auth403RetryManager:
         self.pinned_ctx: SessionContext | None = None
         self.force_recreate_signer: bool = False
 
+    @staticmethod
+    def _diagnostic_context(
+        client: AIStudioClient,
+        prepared: PreparedRequest | None,
+        request_ctx: SessionContext | None,
+    ) -> str:
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            DEFAULT_BROWSER_USER_AGENT,
+        )
+
+        outer_ua = DEFAULT_BROWSER_USER_AGENT
+        pool_state = ""
+        if prepared is not None and isinstance(prepared.headers, dict):
+            outer_ua = str(prepared.headers.get("User-Agent") or outer_ua)
+        session = getattr(client, "session", None)
+        signer = getattr(session, "_signer", None) if session is not None else None
+        if signer is not None:
+            pool_state = str(getattr(signer, "last_pool_state", "") or "")
+        acc, acc_id = _request_account(request_ctx)
+        auth_user = (
+            acc.auth_user
+            if acc is not None
+            else (request_ctx.auth_user if request_ctx is not None else "0")
+        )
+        return (
+            f"account={acc_id or 'unknown'}(u/{auth_user}), "
+            f"signer=local_ipc, pool={pool_state or 'unknown'}, "
+            f"ua={outer_ua[:48] or 'default'}"
+        )
+
     async def handle_403(
         self,
         exc: Exception,
         *,
         model: str,
         client: AIStudioClient,
+        request_ctx: SessionContext | None = None,
         has_yielded_data: bool = False,
     ) -> bool:
-        request_ctx = self.current_prepared.ctx if self.current_prepared else None
+        if request_ctx is None and self.current_prepared is not None:
+            request_ctx = self.current_prepared.ctx
         if not _is_request_generation_current(request_ctx):
             self.current_prepared = None
             self.pinned_ctx = None
@@ -186,17 +279,21 @@ class Auth403RetryManager:
                 403, detail={"message": str(exc), "type": "auth_error"}
             ) from exc
 
+        diag = self._diagnostic_context(client, self.current_prepared, request_ctx)
         self.count += 1
-        _record_request_auth_error(model, request_ctx)
+        _record_request_rotator_event(
+            "auth_error", model=model, request_ctx=request_ctx
+        )
 
         # 1. 前 2 次 403: 重放已签名请求
         if self.count <= 2:
             # 本次快照由请求处理器绑定，不读取客户端共享的最近请求。
             self.force_recreate_signer = False
             logger.warning(
-                "HTTP 403 重试 (%d/2 重放): model=%s",
+                "HTTP 403 重试 (%d/2 重放): model=%s, %s",
                 self.count,
                 model,
+                diag,
             )
             return True
 
@@ -226,10 +323,11 @@ class Auth403RetryManager:
                         pass
             self.force_recreate_signer = self.count == 3
             logger.warning(
-                "HTTP 403 重试 (%d/2 重签): model=%s, force_recreate=%s",
+                "HTTP 403 重试 (%d/2 重签): model=%s, force_recreate=%s, %s",
                 self.count - 2,
                 model,
                 self.force_recreate_signer,
+                diag,
             )
             return True
 
@@ -245,11 +343,14 @@ class Auth403RetryManager:
                 expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
             ):
                 logger.warning(
-                    "HTTP 403 切换备用账号重试: model=%s",
+                    "HTTP 403 切换备用账号重试: model=%s, %s",
                     model,
+                    diag,
                 )
                 return True
-            logger.error("HTTP 403 且无可用备用账号，停止重试: model=%s", model)
+            logger.error(
+                "HTTP 403 且无可用备用账号，停止重试: model=%s, %s", model, diag
+            )
             raise HTTPException(
                 403, detail={"message": str(exc), "type": "auth_error"}
             ) from exc
@@ -374,6 +475,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -392,6 +494,7 @@ def classify_gemini_error_payload(exc: Exception) -> tuple[int, str, str]:
             500: "INTERNAL",
             502: "UNAVAILABLE",
             503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
         }
         return (
             status,
@@ -500,9 +603,53 @@ async def handle_attempt_exception(
             },
         ) from exc
 
+    if isinstance(exc, (AccountVerificationRequiredError, AccountRestrictedError)):
+        if not _is_request_generation_current(request_ctx):
+            if not has_yielded_data:
+                logger.info("忽略旧 Cookie 代际的验证/受限结果: account=%s", failed_id)
+                return True
+            raise HTTPException(
+                503, detail="Request credentials were replaced."
+            ) from exc
+        _record_request_rotator_event(
+            "auth_error", model=target_model, request_ctx=request_ctx
+        )
+        if account_svc is not None and failed_id:
+            disabled = account_svc.toggle_account_enabled(failed_id, False)
+            auth_u = (
+                active_acc.auth_user
+                if active_acc is not None
+                else (request_ctx.auth_user if request_ctx is not None else "0")
+            )
+            reason = (
+                "需要身份验证"
+                if isinstance(exc, AccountVerificationRequiredError)
+                else "服务受限"
+            )
+            logger.error(
+                "账号 %s (u/%s) %s，已自动禁用 (disabled=%s): %s",
+                failed_id,
+                auth_u,
+                reason,
+                disabled is not None and not disabled.enabled,
+                exc,
+            )
+        if not has_yielded_data and await try_switch_account(
+            model=target_model,
+            failed_account_id=failed_id,
+            expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
+        ):
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            return True
+        raise HTTPException(
+            403, detail={"message": str(exc), "type": "auth_error"}
+        ) from exc
+
     if isinstance(exc, AuthError):
         logger.warning("账号权限被拒绝 (HTTP 403): %s", exc)
-        _record_request_auth_error(target_model, request_ctx)
+        _record_request_rotator_event(
+            "auth_error", model=target_model, request_ctx=request_ctx
+        )
 
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
@@ -510,7 +657,9 @@ async def handle_attempt_exception(
 
     if isinstance(exc, UsageLimitExceeded):
         runtime_state.record(target_model, "rate_limited")
-        record_rotator_event("rate_limited", model=target_model, account_id=failed_id)
+        _record_request_rotator_event(
+            "rate_limited", model=target_model, request_ctx=request_ctx
+        )
         upstream_detail = clean_upstream_error_message(str(exc))
         logger.warning(
             "账号触发 429 限流: model=%s, detail=%s", target_model, upstream_detail
@@ -580,24 +729,27 @@ async def handle_attempt_exception(
         )
         return True
     if is_transport_error(exc):
-        logger.warning(
-            "传输或签名异常，切换账号重试 (%d/%d): %s",
-            attempt + 1,
-            MAX_RETRIES,
-            exc,
+        # 传输失败只能使用普通预算，最后一次失败或已发出内容时不再切号。
+        if not has_yielded_data and attempt < MAX_RETRIES - 1:
+            logger.warning(
+                "传输或签名异常，切换账号重试 (%d/%d): %s",
+                attempt + 1,
+                MAX_RETRIES,
+                exc,
+            )
+            if await try_switch_account(
+                model=target_model, failed_account_id=failed_id
+            ):
+                logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                return True
+        runtime_state.record(target_model, "errors")
+        _record_request_rotator_event(
+            "error", model=target_model, request_ctx=request_ctx
         )
-        if not has_yielded_data and await try_switch_account(
-            model=target_model, failed_account_id=failed_id
-        ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
-            return True
-        if isinstance(exc, TransportError):
-            runtime_state.record(target_model, "errors")
-            record_rotator_event("error", model=target_model, account_id=failed_id)
-            logger.warning("上游传输中断 (502): %s", exc)
-            raise HTTPException(
-                502, detail={"message": str(exc), "type": "upstream_error"}
-            ) from exc
+        logger.warning("上游传输中断 (502): %s", exc)
+        raise HTTPException(
+            502, detail={"message": str(exc), "type": "upstream_error"}
+        ) from exc
     if isinstance(exc, RequestError):
         clean_msg = clean_upstream_error_message(str(exc))
         status_code = exc.status if exc.status > 0 else 500
@@ -617,14 +769,16 @@ async def handle_attempt_exception(
 
     if isinstance(exc, AistudioError):
         runtime_state.record(target_model, "errors")
-        record_rotator_event("error", model=target_model, account_id=failed_id)
+        _record_request_rotator_event(
+            "error", model=target_model, request_ctx=request_ctx
+        )
         logger.warning("服务端处理异常: %s", exc)
         raise HTTPException(
             500, detail={"message": str(exc), "type": "server_error"}
         ) from exc
 
     runtime_state.record(target_model, "errors")
-    record_rotator_event("error", model=target_model, account_id=failed_id)
+    _record_request_rotator_event("error", model=target_model, request_ctx=request_ctx)
     logger.error("请求处理发生未捕获异常: %s", exc)
     logger.debug("异常堆栈详情:", exc_info=True)
     raise HTTPException(
@@ -632,22 +786,29 @@ async def handle_attempt_exception(
     ) from exc
 
 
-async def _do_generate_content(
+async def run_generation(
     model_path: str,
     req: GeminiGenerateContentRequest,
     client: AIStudioClient,
-) -> GeminiGenerateContentResponse:
+) -> ModelOutput:
+    """Shared generation engine; protocol adapters only serialize its result."""
+    model_path, req, wrapped = _resolve_generation_request(model_path, req)
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    ordinary_attempt = 0
 
     for attempt in range(total_attempts):
+        if ordinary_attempt >= MAX_RETRIES:
+            break
         ensured_ctx = await ensure_active_account(attempt, model=model_path)
         effective_ctx = auth_manager.pinned_ctx or (
-            ensured_ctx if isinstance(ensured_ctx, SessionContext) else None
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
         )
         normalized = None
-        request_ctx: SessionContext | None = effective_ctx
+        request_ctx: SessionContext = effective_ctx
         try:
             normalized = normalize_gemini_request(req, model_path)
             logger.info(
@@ -672,16 +833,17 @@ async def _do_generate_content(
                 model=normalized.model, prepared=prepared
             )
             auth_manager.current_prepared = None
+            if wrapped:
+                output = unwrap_text_output(output)
 
             final_fr = to_gemini_finish_reason(
                 output.candidates[0].finish_reason if output.candidates else None
             )
-            _, req_account_id = _request_account(request_ctx)
-            record_rotator_event(
+            _record_request_rotator_event(
                 "success",
                 model=normalized.model,
+                request_ctx=request_ctx,
                 usage=output.usage,
-                account_id=req_account_id,
             )
             runtime_state.record(
                 normalized.model,
@@ -698,60 +860,120 @@ async def _do_generate_content(
                 pt,
                 ct,
             )
-            cand = output.candidates[0] if output.candidates else None
-            return GeminiGenerateContentResponse(
-                candidates=[
-                    GeminiCandidateResponse(
-                        content=GeminiContentResponse(
-                            parts=to_gemini_parts(
-                                output.text,
-                                function_calls=output.function_calls,
-                                function_responses=output.function_responses,
-                                thinking=output.thinking,
-                                images=output.images,
-                                reasoning_images=output.reasoning_images,
-                                thinking_signature=cand.thinking_signature
-                                if cand
-                                else "",
-                                text_signature=cand.text_signature if cand else "",
-                                standalone_signature=(
-                                    cand.standalone_signature if cand else ""
-                                ),
-                            ),
-                        ),
-                        finishReason=final_fr,
-                        index=0,
-                    )
-                ],
-                usageMetadata=to_gemini_usage_metadata(output.usage),
-                modelVersion=normalized.model,
-                responseId=output.response_id or None,
-            )
+            output.model = normalized.model
+            return output
         except Exception as exc:
             last_error = exc
-            if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
+            if isinstance(exc, AuthError) and not isinstance(
+                exc,
+                (
+                    SessionExpiredError,
+                    AccountVerificationRequiredError,
+                    AccountRestrictedError,
+                ),
+            ):
                 target_m = normalized.model if normalized else model_path
-                if await auth_manager.handle_403(exc, model=target_m, client=client):
+                if await auth_manager.handle_403(
+                    exc, model=target_m, client=client, request_ctx=request_ctx
+                ):
                     continue
                 raise
             if await handle_attempt_exception(
                 exc,
-                attempt=attempt,
+                attempt=ordinary_attempt,
                 model_path=model_path,
                 normalized_model=normalized.model if normalized else None,
                 request_ctx=request_ctx,
             ):
+                # 403 单独计数，普通失败不能借用认证重试预算。
+                ordinary_attempt += 1
                 auth_manager.current_prepared = None
                 auth_manager.pinned_ctx = None
                 continue
+            raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{model_path}'. Quota resets at 00:00 PST.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    # 耗尽预算时保留最后一次故障类型，不能统一伪装成配额耗尽。
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error
+
+
+async def _do_generate_content(
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+) -> GeminiGenerateContentResponse:
+    output = await run_generation(model_path, req, client)
+    cand = output.candidates[0] if output.candidates else None
+    return GeminiGenerateContentResponse(
+        candidates=[
+            GeminiCandidateResponse(
+                content=GeminiContentResponse(
+                    parts=to_gemini_parts(
+                        output.text,
+                        function_calls=output.function_calls,
+                        function_responses=output.function_responses,
+                        thinking=output.thinking,
+                        images=output.images,
+                        reasoning_images=output.reasoning_images,
+                        thinking_signature=cand.thinking_signature if cand else "",
+                        text_signature=cand.text_signature if cand else "",
+                        standalone_signature=cand.standalone_signature if cand else "",
+                    ),
+                ),
+                finishReason=to_gemini_finish_reason(
+                    cand.finish_reason if cand else None
+                ),
+                index=0,
+            )
+        ],
+        usageMetadata=to_gemini_usage_metadata(output.usage),
+        modelVersion=output.model,
+        responseId=output.response_id or None,
+    )
+
+
+async def _close_generation_task(
+    task: asyncio.Task[GeminiGenerateContentResponse],
+) -> None:
+    # 响应结束时等待后台任务释放资源，任何清理错误都不能覆盖原响应错误。
+    with CancelScope(shield=True):
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+class _RequestStreamingResponse(StreamingResponse):
+    """在真实 ASGI 生命周期结束时关闭迭代器和非流式生成任务。"""
+
+    def __init__(
+        self,
+        content: AsyncGenerator[str | bytes, None],
+        *,
+        media_type: str,
+        generation_task: asyncio.Task[GeminiGenerateContentResponse] | None = None,
+    ) -> None:
+        if media_type == "text/event-stream":
+            content = with_sse_keepalive(content)
+        super().__init__(
+            content,
+            media_type=media_type,
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        self._iterator = content
+        self._generation_task = generation_task
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # 首响应头就断开时，尚未启动的 body iterator 不会执行自身 finally。
+            with CancelScope(shield=True):
+                try:
+                    await self._iterator.aclose()
+                finally:
+                    if self._generation_task is not None:
+                        await _close_generation_task(self._generation_task)
 
 
 async def handle_gemini_generate_content(
@@ -761,25 +983,30 @@ async def handle_gemini_generate_content(
     *,
     stream: bool,
 ):
-    model_path, req = resolve_catalog_request(model_path, req)
+    # Gate aliases before starting an HTTP stream; the common engine resolves
+    # the original name again when preparing the immutable request snapshot.
+    model_catalog.resolve_variant(model_path)
     if stream:
         return _build_gemini_streaming_response(
             client=client, req=req, model_path=model_path
         )
-
     # 启动非流式生成任务并提供防 524 代理超时的保活机制 (NONSTREAM_KEEPALIVE)
     gen_task = asyncio.create_task(_do_generate_content(model_path, req, client))
     try:
         # 前 10 秒直接等待结果；绝大多数请求在此期间返回标准对象
         return await asyncio.wait_for(asyncio.shield(gen_task), timeout=10.0)
+    except asyncio.CancelledError:
+        # shield 不能让已断开的客户端留下后台生成任务。
+        await _close_generation_task(gen_task)
+        raise
     except TimeoutError:
         logger.info(
             "非流式请求耗时超过 10s，激活 HTTP 换行保活流: model=%s", model_path
         )
 
         async def keepalive_stream():
-            yield b"\n"
             try:
+                yield b"\n"
                 while not gen_task.done():
                     try:
                         await asyncio.wait_for(asyncio.shield(gen_task), timeout=10.0)
@@ -801,15 +1028,12 @@ async def handle_gemini_generate_content(
                 }
                 yield json.dumps(err_payload, ensure_ascii=False).encode("utf-8")
             finally:
-                if not gen_task.done():
-                    gen_task.cancel()
-                elif not gen_task.cancelled():
-                    _ = gen_task.exception()
+                await _close_generation_task(gen_task)
 
-        return StreamingResponse(
+        return _RequestStreamingResponse(
             keepalive_stream(),
             media_type="application/json",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            generation_task=gen_task,
         )
 
 
@@ -842,29 +1066,34 @@ def format_sse_event(
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", function_calls=fc_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "images":
         img_list = text if isinstance(text, list) else []
         parts = [
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", images=img_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "reasoning_images":
         r_img_list = text if isinstance(text, list) else []
         parts = [
             part.model_dump(mode="json", exclude_none=True)
             for part in to_gemini_parts("", reasoning_images=r_img_list)
         ]
-        if thought_signature and parts and not parts[0].get("thoughtSignature"):
-            parts[0]["thoughtSignature"] = thought_signature
     elif event_type == "thought_signature":
         parts = [{"thoughtSignature": str(text)}]
     else:
         return None
 
+    if (
+        thought_signature
+        and parts
+        and event_type in ("tool_calls", "images", "reasoning_images")
+    ):
+        existing_signature = parts[0].get("thoughtSignature")
+        if not existing_signature:
+            parts[0]["thoughtSignature"] = thought_signature
+        elif existing_signature != thought_signature:
+            # 独立签名不能覆盖工具或图片自己的签名，按原顺序保留独立 Part。
+            parts.insert(0, {"thoughtSignature": thought_signature})
     payload: dict[str, object] = {
         "candidates": [{"content": {"role": "model", "parts": parts}, "index": 0}]
     }
@@ -927,182 +1156,225 @@ def format_sse_error(exc: Exception) -> str:
     )
 
 
+async def stream_generation(
+    model_path: str,
+    req: GeminiGenerateContentRequest,
+    client: AIStudioClient,
+) -> AsyncGenerator[tuple[str, object], None]:
+    """Shared stream with account binding, bounded retries and cancellation."""
+    model_path, req, wrapped = _resolve_generation_request(model_path, req)
+    normalized = normalize_gemini_request(req, model_path)
+    auth_manager = Auth403RetryManager()
+    ordinary_attempt = 0
+    last_error: Exception | None = None
+    request_ctx: SessionContext | None = None
+    final_usage: dict[str, object] | None = None
+    final_finish_reason = "FINISH_REASON_UNSPECIFIED"
+    pending_events: list[tuple[str, object]] = []
+    completed = False
+    for attempt in range(MAX_RETRIES + AUTH_403_MAX_RETRIES):
+        if ordinary_attempt >= MAX_RETRIES:
+            break
+        has_yielded_data = False
+        final_usage = None
+        final_finish_reason = "FINISH_REASON_UNSPECIFIED"
+        wrapper = TextWrapperStream() if wrapped else None
+        pending_events = []
+
+        def emit(
+            kind: str, value: object, buffered: list[tuple[str, object]]
+        ) -> list[tuple[str, object]]:
+            nonlocal final_usage, final_finish_reason, has_yielded_data
+            if kind == "usage":
+                final_usage = value if isinstance(value, dict) else None
+            elif kind == "finish_reason":
+                final_finish_reason = to_gemini_finish_reason(
+                    value if isinstance(value, (int, str)) else None
+                )
+            metadata = kind in (
+                "usage",
+                "finish_reason",
+                "done",
+                "response_id",
+                "thought_signature",
+            )
+            if kind == "thought_signature" and any(
+                pending_kind == "thought_signature" for pending_kind, _ in buffered
+            ):
+                # Serializers flush the previous standalone signature when a
+                # second arrives, so replay is no longer safe from this point.
+                has_yielded_data = True
+            if not has_yielded_data and (metadata or not value):
+                buffered.append((kind, value))
+                return []
+            has_yielded_data = True
+            outgoing = [*buffered, (kind, value)]
+            buffered.clear()
+            return outgoing
+
+        ensured_ctx = await ensure_active_account(attempt, model=model_path)
+        effective_ctx = auth_manager.pinned_ctx or (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
+        request_ctx = effective_ctx
+        try:
+            force_recreate = auth_manager.force_recreate_signer
+            auth_manager.force_recreate_signer = False
+            prepared = await _prepare_content_request(
+                client,
+                normalized,
+                auth_manager.current_prepared,
+                force_recreate_signer=force_recreate,
+                ctx=effective_ctx,
+            )
+            request_ctx = prepared.ctx or effective_ctx
+            auth_manager.current_prepared = prepared
+            async with aclosing(
+                client.stream_generate_content(
+                    model=normalized.model, prepared=prepared
+                )
+            ) as events:
+                async for event_type, payload in events:
+                    outgoing = (
+                        wrapper.feed(event_type, payload)
+                        if wrapper is not None
+                        else [(event_type, payload)]
+                    )
+                    for kind, value in outgoing:
+                        for event in emit(kind, value, pending_events):
+                            yield event
+            if wrapper is not None:
+                for kind, value in wrapper.finish():
+                    for event in emit(kind, value, pending_events):
+                        yield event
+            for event in pending_events:
+                yield event
+            auth_manager.current_prepared = None
+            completed = True
+            break
+        except Exception as exc:
+            last_error = exc
+            if (
+                isinstance(exc, AuthError)
+                and not isinstance(
+                    exc,
+                    (
+                        SessionExpiredError,
+                        AccountVerificationRequiredError,
+                        AccountRestrictedError,
+                    ),
+                )
+                and not has_yielded_data
+            ):
+                if await auth_manager.handle_403(
+                    exc,
+                    model=normalized.model,
+                    client=client,
+                    request_ctx=request_ctx,
+                    has_yielded_data=has_yielded_data,
+                ):
+                    continue
+                raise
+            if await handle_attempt_exception(
+                exc,
+                attempt=ordinary_attempt,
+                model_path=model_path,
+                normalized_model=normalized.model,
+                request_ctx=request_ctx,
+                has_yielded_data=has_yielded_data,
+            ):
+                ordinary_attempt += 1
+                auth_manager.current_prepared = None
+                auth_manager.pinned_ctx = None
+                continue
+            raise
+    if not completed:
+        error = last_error or TransportError("Request retry budget exhausted.")
+        status, message, _ = classify_gemini_error_payload(error)
+        raise HTTPException(status, detail={"message": message}) from error
+    _record_request_rotator_event(
+        "success",
+        model=normalized.model,
+        request_ctx=request_ctx,
+        usage=final_usage,
+    )
+    runtime_state.record(
+        normalized.model,
+        "success",
+        usage=final_usage,
+        finish_reason=final_finish_reason,
+    )
+
+
 def _build_gemini_streaming_response(
     *,
     client: AIStudioClient,
     req: GeminiGenerateContentRequest,
     model_path: str,
 ) -> StreamingResponse:
-    async def stream_response():
-        normalized = None
-        stream_start_time = time.perf_counter()
+    async def serialize():
+        final_usage: dict[str, object] | None = None
+        final_finish_reason = "FINISH_REASON_UNSPECIFIED"
+        latest_response_id: str | None = None
+        buffered_thought_sig: str | None = None
+        resolved_model = model_catalog.resolve_variant(model_path).model
         try:
-            logger.info(
-                "流式请求: model=%s, 轮数=%d",
-                model_path,
-                len(req.contents),
-            )
-            final_usage: dict[str, object] | None = None
-            final_finish_reason: str = "STOP"
-            latest_response_id: str | None = None
-            buffered_thought_sig: str | None = None
-            stream_completed = False
-            last_stream_error: Exception | None = None
-            auth_manager = Auth403RetryManager()
-            last_request_ctx: SessionContext | None = None
-            total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
-            for stream_attempt in range(total_attempts):
-                has_yielded_data = False
-                last_stream_error = None
-                final_usage = None
-                final_finish_reason = "STOP"
-                latest_response_id = None
-                buffered_thought_sig = None
-                ensured_ctx = await ensure_active_account(
-                    stream_attempt, model=model_path
-                )
-                effective_ctx = auth_manager.pinned_ctx or (
-                    ensured_ctx if isinstance(ensured_ctx, SessionContext) else None
-                )
-                normalized = normalize_gemini_request(req, model_path)
-                request_ctx = effective_ctx
-                try:
-                    force_recreate = auth_manager.force_recreate_signer
-                    auth_manager.force_recreate_signer = False
-                    prepared = await _prepare_content_request(
-                        client,
-                        normalized,
-                        auth_manager.current_prepared,
-                        force_recreate_signer=force_recreate,
-                        ctx=effective_ctx,
-                    )
-                    request_ctx = prepared.ctx or effective_ctx
-                    last_request_ctx = request_ctx
-                    auth_manager.current_prepared = prepared
-                    async for event_type, text in client.stream_generate_content(
-                        model=normalized.model, prepared=prepared
-                    ):
-                        if event_type == "usage":
-                            final_usage = text if isinstance(text, dict) else None
-                        elif event_type == "finish_reason":
-                            if text not in (None, 0, 22):
-                                final_finish_reason = (
-                                    to_gemini_finish_reason(text)
-                                    if isinstance(text, int)
-                                    else str(text)
-                                )
-                        elif event_type == "response_id":
-                            latest_response_id = str(text)
-                        elif event_type == "thought_signature":
-                            buffered_thought_sig = str(text)
-                        elif event_type == "done":
-                            continue
-                        else:
-                            chunk = format_sse_event(
-                                event_type,
-                                text,
-                                model_version=normalized.model,
-                                response_id=latest_response_id,
-                                thought_signature=buffered_thought_sig,
-                            )
-                            if chunk:
-                                buffered_thought_sig = None
-                                if not has_yielded_data:
-                                    ttft_ms = (
-                                        time.perf_counter() - stream_start_time
-                                    ) * 1000
-                                    logger.info(
-                                        "流式首包到达: model=%s, ttft=%.1fms",
-                                        normalized.model,
-                                        ttft_ms,
-                                    )
-                                has_yielded_data = True
-                                yield chunk
-                    if buffered_thought_sig:
-                        chunk = format_sse_event(
-                            "thought_signature",
-                            buffered_thought_sig,
-                            model_version=normalized.model,
-                            response_id=latest_response_id,
+            async with aclosing(stream_generation(model_path, req, client)) as events:
+                async for event_type, payload in events:
+                    if event_type == "usage":
+                        final_usage = payload if isinstance(payload, dict) else None
+                    elif event_type == "finish_reason":
+                        final_finish_reason = to_gemini_finish_reason(
+                            payload if isinstance(payload, (int, str)) else None
                         )
-                        buffered_thought_sig = None
+                    elif event_type == "response_id":
+                        latest_response_id = str(payload)
+                    elif event_type == "thought_signature":
+                        if buffered_thought_sig:
+                            yield (
+                                format_sse_event(
+                                    "thought_signature",
+                                    buffered_thought_sig,
+                                    model_version=resolved_model,
+                                    response_id=latest_response_id,
+                                )
+                                or ""
+                            )
+                        buffered_thought_sig = str(payload)
+                    elif event_type != "done":
+                        chunk = format_sse_event(
+                            event_type,
+                            payload,
+                            model_version=resolved_model,
+                            response_id=latest_response_id,
+                            thought_signature=buffered_thought_sig,
+                        )
                         if chunk:
-                            has_yielded_data = True
+                            buffered_thought_sig = None
                             yield chunk
-                    auth_manager.current_prepared = None
-                    stream_completed = True
-                    break
-                except Exception as exc:
-                    last_stream_error = exc
-                    if (
-                        isinstance(exc, AuthError)
-                        and not isinstance(exc, SessionExpiredError)
-                        and not has_yielded_data
-                    ):
-                        target_m = normalized.model if normalized else model_path
-                        if await auth_manager.handle_403(
-                            exc,
-                            model=target_m,
-                            client=client,
-                            has_yielded_data=has_yielded_data,
-                        ):
-                            continue
-                        raise
-                    if await handle_attempt_exception(
-                        exc,
-                        attempt=stream_attempt,
-                        model_path=model_path,
-                        normalized_model=normalized.model if normalized else None,
-                        request_ctx=request_ctx,
-                        has_yielded_data=has_yielded_data,
-                    ):
-                        auth_manager.current_prepared = None
-                        auth_manager.pinned_ctx = None
-                        continue
-
-            if not stream_completed and last_stream_error is not None:
-                raise last_stream_error
-            target_model = normalized.model if normalized else model_path
-            _, req_account_id = _request_account(last_request_ctx)
-            record_rotator_event(
-                "success",
-                model=target_model,
-                usage=final_usage,
-                account_id=req_account_id,
-            )
-            if normalized is not None:
-                runtime_state.record(
-                    normalized.model,
-                    "success",
-                    usage=final_usage,
-                    finish_reason=final_finish_reason,
+            if buffered_thought_sig:
+                yield (
+                    format_sse_event(
+                        "thought_signature",
+                        buffered_thought_sig,
+                        model_version=resolved_model,
+                        response_id=latest_response_id,
+                    )
+                    or ""
                 )
-            elapsed_total_ms = (time.perf_counter() - stream_start_time) * 1000
-            pt = final_usage.get("prompt_tokens") if final_usage else 0
-            ct = final_usage.get("completion_tokens") if final_usage else 0
-            logger.info(
-                "流式完成: model=%s, 耗时=%.1fms, finish=%s, in=%s, out=%s",
-                target_model,
-                elapsed_total_ms,
-                final_finish_reason,
-                pt,
-                ct,
-            )
             yield format_sse_usage(
                 final_usage,
                 finish_reason=final_finish_reason,
-                model_version=target_model,
+                model_version=resolved_model,
                 response_id=latest_response_id,
             )
         except Exception as exc:
             logger.warning("流式生成异常: model=%s, error=%s", model_path, exc)
             yield format_sse_error(exc)
 
-    return StreamingResponse(
-        stream_response(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return _RequestStreamingResponse(serialize(), media_type="text/event-stream")
 
 
 async def handle_gemini_decisions(
@@ -1112,6 +1384,7 @@ async def handle_gemini_decisions(
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
     total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    ordinary_attempt = 0
     raw_model = req.model or "gemini-decision-1"
     norm_model, _ = model_catalog.resolve(raw_model)
     questions_dict: dict[str, dict[str, object]] = {
@@ -1120,11 +1393,15 @@ async def handle_gemini_decisions(
     }
 
     for attempt in range(total_attempts):
+        if ordinary_attempt >= MAX_RETRIES:
+            break
         ensured_ctx = await ensure_active_account(attempt, model=norm_model)
         effective_ctx = auth_manager.pinned_ctx or (
-            ensured_ctx if isinstance(ensured_ctx, SessionContext) else None
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
         )
-        request_ctx: SessionContext | None = effective_ctx
+        request_ctx: SessionContext = effective_ctx
         try:
             logger.info(
                 "Decisions 请求: model=%s, questions=%d, 尝试=%d/%d",
@@ -1136,8 +1413,18 @@ async def handle_gemini_decisions(
             force_recreate = auth_manager.force_recreate_signer
             auth_manager.force_recreate_signer = False
             prepared = auth_manager.current_prepared
-            if prepared is None:
-                if isinstance(effective_ctx, SessionContext):
+            if (
+                prepared is not None
+                and not force_recreate
+                and not _is_prepared_binding_current(prepared)
+            ):
+                # 与生成接口一致，切号、禁用或凭据更新后不能重放缓存签名。
+                prepared = None
+            if prepared is None or force_recreate:
+                if (
+                    isinstance(effective_ctx, SessionContext)
+                    and effective_ctx.auth_file
+                ):
                     prepared = await client.prepare_decision_request(
                         model=norm_model,
                         raw_input=req.input,
@@ -1171,12 +1458,11 @@ async def handle_gemini_decisions(
                 "completion_tokens": 0,
                 "total_tokens": total_tokens,
             }
-            _, req_account_id = _request_account(request_ctx)
-            record_rotator_event(
+            _record_request_rotator_event(
                 "success",
                 model=norm_model,
+                request_ctx=request_ctx,
                 usage=rotator_usage,
-                account_id=req_account_id,
             )
             runtime_state.record(
                 norm_model,
@@ -1206,28 +1492,36 @@ async def handle_gemini_decisions(
             )
         except Exception as exc:
             last_error = exc
-            if isinstance(exc, AuthError) and not isinstance(exc, SessionExpiredError):
-                if await auth_manager.handle_403(exc, model=norm_model, client=client):
+            if isinstance(exc, AuthError) and not isinstance(
+                exc,
+                (
+                    SessionExpiredError,
+                    AccountVerificationRequiredError,
+                    AccountRestrictedError,
+                ),
+            ):
+                if await auth_manager.handle_403(
+                    exc, model=norm_model, client=client, request_ctx=request_ctx
+                ):
                     continue
                 raise
             if await handle_attempt_exception(
                 exc,
-                attempt=attempt,
+                attempt=ordinary_attempt,
                 model_path=norm_model,
                 normalized_model=norm_model,
                 request_ctx=request_ctx,
             ):
+                ordinary_attempt += 1
                 auth_manager.current_prepared = None
                 auth_manager.pinned_ctx = None
                 continue
+            raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{norm_model}'. Quota resets at 00:00 PST.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    # 普通预算耗尽后保留实际故障，不能将会话失效或传输失败改报日配额。
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error
 
 
 async def handle_gemini_count_tokens(
@@ -1235,6 +1529,10 @@ async def handle_gemini_count_tokens(
     req: GeminiCountTokensRequest,
     client: AIStudioClient,
 ) -> GeminiCountTokensResponse:
+    if model_catalog.resolve_variant(model_path).text_wrapper:
+        raise HTTPException(
+            400, detail="Text wrapper models do not support countTokens"
+        )
     if req.generateContentRequest is not None:
         effective_req = req.generateContentRequest
     elif req.contents is not None:
@@ -1253,17 +1551,35 @@ async def handle_gemini_count_tokens(
         )
 
     model_path, effective_req = resolve_catalog_request(model_path, effective_req)
+    if (
+        effective_req.systemInstruction is not None
+        and effective_req.systemInstruction.parts
+    ) or effective_req.tools:
+        # 当前计数 RPC 只承载 contents，拒绝静默丢弃会影响计数的字段。
+        raise HTTPException(
+            400,
+            detail={
+                "message": "countTokens currently supports contents only; systemInstruction and tools are not supported.",
+                "type": "bad_request",
+            },
+        )
+
     normalized = normalize_gemini_request(effective_req, model_path)
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         ensured_ctx = await ensure_active_account(attempt, model=normalized.model)
-        effective_ctx = ensured_ctx if isinstance(ensured_ctx, SessionContext) else None
+        # 在请求进入客户端前绑定实际账号，失败时不读取已切换的全局会话。
+        request_ctx = (
+            ensured_ctx
+            if isinstance(ensured_ctx, SessionContext)
+            else _request_context_snapshot(client)
+        )
         try:
-            if isinstance(effective_ctx, SessionContext):
+            if isinstance(ensured_ctx, SessionContext):
                 res = await client.count_tokens(
                     model=normalized.model,
                     contents=normalized.contents,
-                    ctx=effective_ctx,
+                    ctx=ensured_ctx,
                 )
             else:
                 res = await client.count_tokens(
@@ -1289,9 +1605,6 @@ async def handle_gemini_count_tokens(
             )
         except Exception as exc:
             last_error = exc
-            request_ctx = effective_ctx or getattr(
-                getattr(client, "session", None), "active_context", None
-            )
             if await handle_attempt_exception(
                 exc,
                 attempt=attempt,
@@ -1302,20 +1615,17 @@ async def handle_gemini_count_tokens(
                 continue
             raise
 
-    raise HTTPException(
-        429,
-        detail={
-            "message": f"All accounts reached daily quota for model '{normalized.model}'.",
-            "type": "rate_limit_exceeded",
-        },
-    ) from last_error
+    error = last_error or TransportError("Request retry budget exhausted.")
+    status_code, message, _ = classify_gemini_error_payload(error)
+    raise HTTPException(status_code, detail={"message": message}) from error
 
 
 def resolve_catalog_request(
     model_path: str,
     req: GeminiGenerateContentRequest,
 ) -> tuple[str, GeminiGenerateContentRequest]:
-    resolved, level = model_catalog.resolve(model_path)
+    variant = model_catalog.resolve_variant(model_path)
+    resolved, level = variant.model, variant.thinking_level
     if level is None:
         return resolved, req
     config = req.generationConfig or GeminiGenerationConfig()
@@ -1332,3 +1642,16 @@ def resolve_catalog_request(
     return resolved, req.model_copy(
         update={"generationConfig": config, "reasoningEffort": None}
     )
+
+
+def _resolve_generation_request(
+    model_path: str, req: GeminiGenerateContentRequest
+) -> tuple[str, GeminiGenerateContentRequest, bool]:
+    variant = model_catalog.resolve_variant(model_path)
+    resolved, effective = resolve_catalog_request(model_path, req)
+    if variant.text_wrapper:
+        try:
+            effective = wrap_text_request(effective)
+        except ValueError as exc:
+            raise HTTPException(400, detail={"message": str(exc)}) from exc
+    return resolved, effective, variant.text_wrapper

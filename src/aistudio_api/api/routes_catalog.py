@@ -14,6 +14,8 @@ from aistudio_api.infrastructure.gateway.model_catalog import (
     model_catalog,
     model_id,
     supported_levels,
+    supports_text_wrapper,
+    wrapper_alias_id,
 )
 from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
@@ -45,6 +47,11 @@ async def list_catalog(
                 "policy": policy.model_dump(mode="json"),
                 "supported_levels": levels,
                 "aliases": {level: alias_id(base, level) for level in ThinkingLevel},
+                "supports_text_wrapper": supports_text_wrapper(info),
+                "wrapper_alias": wrapper_alias_id(base),
+                "wrapper_thinking_aliases": {
+                    level: wrapper_alias_id(base, level) for level in ThinkingLevel
+                },
             }
         )
     return {
