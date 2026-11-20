@@ -19,7 +19,7 @@
 `aistudio-api` 是 Google AI Studio 反向代理网关。本 fork 默认同时提供原生 **Gemini API**（`/v1beta/...`）和 **OpenAI Chat Completions**（`/v1/...`）兼容接口。
 
 - **共用生成引擎**：Gemini 保留原生多模态与工具能力；OpenAI 入口仅适配消息与响应，必须共用账号调度、模型策略、签名和重试。Chat Completions 不代表已实现 Responses 或 Images API。
-- **可选文本包装**：`-抗截断` 模型别名启用实验工具包装，与思考后缀独立配置。仅支持文本，不覆盖客户真实 tools 或结构化输出；保留终态与 usage，不能宣称保证不截断或自动续写。
+- **可选文本包装**：`-抗截断` 模型别名启用实验工具包装，与思考后缀独立配置。兼容应用函数工具并保留真实调用历史、ID 和签名；只隐藏内部输出工具，不改写外部工具。仍不支持媒体或结构化输出，不能宣称保证不截断或自动续写。
 - **无浏览器 WAA 签名架构**：通过本地 `waa-signer` 子进程（嵌入式 SpiderMonkey 152 + Firefox 152 DOM 宿主）经 `stdin`/`stdout` 多路复用 NDJSON IPC 生成 `!proof` 令牌，配合 `httpx` HTTP/2 异步连接池直连 Google AI Studio。
 - **代码即事实标准（Code as Ground Truth）**：以通过测试验证的代码为准。当文档与代码逻辑不一致时，以代码为准并同步更新文档。
 - **接口契约优先（Contract over Brittle Mocks）**：测试应对齐公共接口契约，避免耦合私有属性。

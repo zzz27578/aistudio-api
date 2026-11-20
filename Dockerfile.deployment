@@ -30,7 +30,7 @@ RUN chmod +x build.sh && ./build.sh --test && ./build.sh
 # Match the signer builder runtime ABI (Debian 13 / trixie).
 FROM python:3.11-slim-trixie
 ARG UPSTREAM_REVISION=8a919084cac1bbb08307870cd5cbef07e5f09866
-ARG CUSTOM_BUILD=fork-8a91908-openai-20261120
+ARG CUSTOM_BUILD=fork-8a91908-tools-20261120
 ARG CUSTOM_REVISION=unknown
 ENV AISTUDIO_UPSTREAM_REVISION=${UPSTREAM_REVISION} \
     AISTUDIO_CUSTOM_BUILD=${CUSTOM_BUILD} \

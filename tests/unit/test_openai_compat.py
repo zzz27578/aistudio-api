@@ -562,7 +562,7 @@ async def test_wrapper_alias_uses_shared_engine_and_preserves_usage(
 
 
 @pytest.mark.asyncio
-async def test_wrapper_rejects_external_tools_with_openai_error(offline_openai):
+async def test_wrapper_rejects_reserved_tool_name_with_openai_error(offline_openai):
     model_catalog.update(
         "gemini-test", ModelPolicy(text_wrapper=AliasPolicy(enabled=True))
     )
@@ -572,7 +572,9 @@ async def test_wrapper_rejects_external_tools_with_openai_error(offline_openai):
             json={
                 "model": wrapper_alias_id("gemini-test"),
                 "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                "tools": [
+                    {"type": "function", "function": {"name": "emit_complete_response"}}
+                ],
             },
         )
     assert response.status_code == 400

@@ -87,8 +87,7 @@ def test_request_conversion_preserves_system_config_signatures_and_original():
     "updates",
     [
         {"tools": [{"googleSearch": {}}]},
-        {"tools": [{"functionDeclarations": [{"name": "real_tool"}]}]},
-        {"toolConfig": {"functionCallingConfig": {"mode": "NONE"}}},
+        {"tools": [{"functionDeclarations": [{"name": WRAPPER_TOOL_NAME}]}]},
         {"generationConfig": {"responseSchema": {}}},
         {"generationConfig": {"responseMimeType": "application/json"}},
         {"generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}},
@@ -96,14 +95,6 @@ def test_request_conversion_preserves_system_config_signatures_and_original():
         {
             "contents": [
                 {"parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}
-            ]
-        },
-        {
-            "contents": [
-                {
-                    "role": "model",
-                    "parts": [{"functionCall": {"name": "real", "args": {}}}],
-                }
             ]
         },
         {"contents": [{"role": "tool", "parts": [{"text": "result"}]}]},
@@ -135,7 +126,7 @@ def test_nonstream_restores_text_without_forging_terminal_or_usage():
     assert restored.function_calls == []
     assert restored.thinking == "reasoning"
     assert restored.candidates[0].thinking_signature == "thinking-sig"
-    assert restored.candidates[0].standalone_signature == "tool-sig"
+    assert restored.candidates[0].standalone_signature == ""
     assert restored.candidates[0].finish_reason == 2
     assert restored.candidates[0].finish_message == "token limit"
     assert restored.response_id == "r-1"
@@ -166,7 +157,6 @@ def test_stream_buffers_content_but_preserves_terminal_order_and_signatures():
     assert stream.feed("done", None) == []
     assert stream.finish() == [
         ("body", "hello world"),
-        ("thought_signature", "sig-1"),
         ("finish_reason", 2),
         ("usage", usage),
         ("done", None),
@@ -188,7 +178,6 @@ def test_stream_does_not_invent_success_or_deduplicate_repeated_delta_text():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"name": "other", "args": {}},
         {"name": WRAPPER_TOOL_NAME, "arguments": '{"display_stream":"half'},
     ],
 )

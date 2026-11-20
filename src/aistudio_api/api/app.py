@@ -291,7 +291,7 @@ async def lifespan(_app: FastAPI):
     runtime_state.rotator = None
 
 
-app = FastAPI(title="AI Studio API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="AI Studio API", version="0.2.1", lifespan=lifespan)
 app.include_router(system_public_router)
 app.include_router(system_protected_router, dependencies=[Depends(require_web_auth)])
 app.include_router(catalog_router, dependencies=[Depends(require_web_auth)])

@@ -291,7 +291,7 @@ class ModelCatalog:
                             "displayName": f"{info.get('displayName', base)} · {level + ' · ' if level else ''}抗截断（实验文本包装）",
                             "description": (
                                 f"{base}; experimental text tool wrapping; buffered response; "
-                                "no automatic continuation; text only; no external tools or schema"
+                                "no automatic continuation; text and application functions; no media or schema"
                                 + (f"; fixed thinkingLevel={level}" if level else "")
                             ),
                             "supportedGenerationMethods": [

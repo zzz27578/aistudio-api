@@ -350,7 +350,8 @@ onMounted(() => fetchModels())
               </h3>
               <p class="mt-1 text-xs text-gray-500 leading-5">
                 使用文本包装提示并缓冲完整回答，可能减少部分提前结束；不保证不断流，也不会自动续写。
-                仅支持纯文本请求，不支持工具调用、图片、音视频或结构化输出；首段内容会等待生成完成。
+                支持文本对话及 AstrBot 等应用的函数工具，工具调用照常返回；最终正文缓冲后返回。
+                暂不支持图片、音视频、结构化输出和上游内置工具。
               </p>
               <div
                 v-if="model.supports_text_wrapper"

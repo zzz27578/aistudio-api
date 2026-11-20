@@ -198,7 +198,7 @@ This service does not store your Google account password. It uses standard web s
 
 Both protocols are enabled on the same port. For an OpenAI-compatible client, use base URL `http://localhost:8080/v1` with `/v1/models` and `/v1/chat/completions`. Gemini clients keep the configuration below. Both share API keys, accounts, quota and model policies.
 
-OpenAI compatibility covers chat, SSE, image inputs, reasoning and function calls; it does not provide Responses, Images, Audio or Embeddings endpoints. Native Gemini image generation remains available. Experimental `-抗截断` aliases buffer text and cannot be combined with external tools, structured output or multimodal input; they do not guarantee complete output or automatically continue interrupted answers.
+OpenAI compatibility covers chat, SSE, image inputs, reasoning and function calls; it does not provide Responses, Images, Audio or Embeddings endpoints. Native Gemini image generation remains available. Experimental `-抗截断` aliases buffer text and support application function tools, retaining real tool IDs and signatures. Structured output, media and provider built-in tools remain unsupported; wrapping does not guarantee complete output or automatically continue interrupted answers.
 
 | Setting | Value | Description |
 |---|---|---|

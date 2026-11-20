@@ -7,6 +7,7 @@ Request transformation happens before normal normalization and signing.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from dataclasses import dataclass, field, replace
 
@@ -29,24 +30,55 @@ _WRAPPER_INSTRUCTION = (
     "this function call. The conversation is represented by this function and "
     "its user_input responses. Follow all system instructions and safety requirements."
 )
+_TOOL_WRAPPER_INSTRUCTION = (
+    "Use the application's function tools when needed. To give the final answer "
+    "to the user, call emit_complete_response once and put the complete answer "
+    "in display_stream. That function is an internal output carrier, not an "
+    "application action. Do not call it in the same turn as an application tool. "
+    "Preserve the existing conversation and follow all system instructions and "
+    "safety requirements."
+)
 _MAX_BUFFERED_CHARACTERS = 8 * 1024 * 1024
 StreamEvent = tuple[str, object | None]
 
 
-def _require_text_parts(content: GeminiContent) -> None:
+def _require_text_parts(
+    content: GeminiContent, *, allow_functions: bool = False
+) -> None:
     for part in content.parts:
         values = part.model_dump(exclude_none=True)
-        if set(values) - {"text", "thought", "thoughtSignature"}:
+        allowed = {"text", "thought", "thoughtSignature"}
+        if allow_functions:
+            allowed.update(("functionCall", "functionResponse"))
+        if set(values) - allowed:
             raise ValueError("Text wrapper models only accept text conversation parts")
+        if part.functionCall is not None and content.role not in ("model", "assistant"):
+            raise ValueError("Function calls must be in model history")
+        if part.functionResponse is not None:
+            if (content.role or "user") != "user":
+                raise ValueError("Function responses must be in user history")
+            if part.functionResponse.parts:
+                _require_text_parts(GeminiContent(parts=part.functionResponse.parts))
 
 
-def _validate_request(req: GeminiGenerateContentRequest) -> None:
+def _validate_request(req: GeminiGenerateContentRequest) -> list[str]:
     if not req.contents:
         raise ValueError("contents is required")
-    if req.tools:
-        raise ValueError("Text wrapper models cannot be combined with external tools")
-    if req.toolConfig:
-        raise ValueError("Text wrapper models manage their own toolConfig")
+    names: list[str] = []
+    for tool in req.tools or []:
+        if set(tool.model_dump(exclude_none=True)) - {"functionDeclarations"}:
+            raise ValueError(
+                "Text wrapper models support application function tools only"
+            )
+        for declaration in tool.functionDeclarations or []:
+            name = declaration.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("Application function tools require a name")
+            if name == WRAPPER_TOOL_NAME:
+                raise ValueError("emit_complete_response is reserved for text wrapping")
+            if name in names:
+                raise ValueError("Duplicate application function name")
+            names.append(name)
     config = req.generationConfig
     if config is not None:
         if config.responseSchema is not None or (
@@ -68,11 +100,93 @@ def _validate_request(req: GeminiGenerateContentRequest) -> None:
     for content in req.contents:
         if (content.role or "user").lower() not in ("user", "model", "assistant"):
             raise ValueError("Text wrapper history only accepts user and model roles")
-        _require_text_parts(content)
+        _require_text_parts(content, allow_functions=True)
         if (content.role or "user").lower() == "user" and any(
             part.thought or part.thoughtSignature for part in content.parts
         ):
             raise ValueError("User text cannot carry model thoughts or signatures")
+    return names
+
+
+def _wrapper_tool() -> GeminiTool:
+    return GeminiTool(
+        functionDeclarations=[
+            {
+                "name": WRAPPER_TOOL_NAME,
+                "description": "Return the complete user-visible answer.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {"display_stream": {"type": "STRING"}},
+                    "required": ["display_stream"],
+                },
+            }
+        ]
+    )
+
+
+def _wrapper_tool_config(
+    req: GeminiGenerateContentRequest, names: list[str]
+) -> dict[str, object]:
+    config = copy.deepcopy(req.toolConfig or {})
+    raw = config.pop("functionCallingConfig", None)
+    snake_raw = config.pop("function_calling_config", None)
+    if raw is None:
+        raw = snake_raw
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("functionCallingConfig must be an object")
+    if set(raw) - {"mode", "allowedFunctionNames", "allowed_function_names"}:
+        raise ValueError("Unsupported function calling configuration for text wrapping")
+    modes = {0: "AUTO", 1: "AUTO", 2: "ANY", 3: "NONE", 4: "VALIDATED"}
+    raw_mode = raw.get("mode", "AUTO")
+    mode = modes.get(raw_mode) if isinstance(raw_mode, int) else str(raw_mode).upper()
+    if mode == "MODE_UNSPECIFIED":
+        mode = "AUTO"
+    if mode not in ("AUTO", "ANY", "NONE", "VALIDATED"):
+        raise ValueError("Unsupported function calling mode for text wrapping")
+    allowed = raw.get("allowedFunctionNames", raw.get("allowed_function_names"))
+    if allowed is not None and (
+        not isinstance(allowed, list)
+        or any(not isinstance(name, str) or name not in names for name in allowed)
+    ):
+        raise ValueError(
+            "allowedFunctionNames must name declared application functions"
+        )
+    selected = list(allowed) if isinstance(allowed, list) and allowed else list(names)
+    if mode == "NONE":
+        # Disable application actions while retaining our private output carrier.
+        selected = [WRAPPER_TOOL_NAME]
+    elif mode == "ANY":
+        # A required/specific application tool must not be satisfied by final text.
+        if not selected:
+            raise ValueError("Required application tool is not declared")
+    else:
+        selected.append(WRAPPER_TOOL_NAME)
+    config["functionCallingConfig"] = {"mode": "ANY", "allowedFunctionNames": selected}
+    return config
+
+
+def _wrap_with_application_tools(
+    req: GeminiGenerateContentRequest, names: list[str]
+) -> GeminiGenerateContentRequest:
+    system = (
+        req.systemInstruction.model_copy(deep=True)
+        if req.systemInstruction
+        else GeminiContent(parts=[])
+    )
+    system.parts.append(GeminiPart(text=_TOOL_WRAPPER_INSTRUCTION))
+    return req.model_copy(
+        update={
+            "contents": [content.model_copy(deep=True) for content in req.contents],
+            "systemInstruction": system,
+            "tools": [
+                *(tool.model_copy(deep=True) for tool in req.tools or []),
+                _wrapper_tool(),
+            ],
+            "toolConfig": _wrapper_tool_config(req, names),
+        }
+    )
 
 
 @dataclass
@@ -87,7 +201,14 @@ def wrap_text_request(
     req: GeminiGenerateContentRequest,
 ) -> GeminiGenerateContentRequest:
     """Build a private tool chain without mutating or discarding client fields."""
-    _validate_request(req)
+    names = _validate_request(req)
+    if names or any(
+        part.functionCall is not None or part.functionResponse is not None
+        for content in req.contents
+        for part in content.parts
+    ):
+        # Real tool transcripts must keep their original parts, IDs and signatures.
+        return _wrap_with_application_tools(req, names)
     turns: list[_TextTurn] = []
     for content in req.contents:
         role = "user" if (content.role or "user").lower() == "user" else "model"
@@ -165,27 +286,8 @@ def wrap_text_request(
         update={
             "contents": contents,
             "systemInstruction": system,
-            "tools": [
-                GeminiTool(
-                    functionDeclarations=[
-                        {
-                            "name": WRAPPER_TOOL_NAME,
-                            "description": "Return the complete user-visible answer.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {"display_stream": {"type": "STRING"}},
-                                "required": ["display_stream"],
-                            },
-                        }
-                    ]
-                )
-            ],
-            "toolConfig": {
-                "functionCallingConfig": {
-                    "mode": "ANY",
-                    "allowedFunctionNames": [WRAPPER_TOOL_NAME],
-                }
-            },
+            "tools": [_wrapper_tool()],
+            "toolConfig": _wrapper_tool_config(req, names),
         }
     )
 
@@ -227,20 +329,21 @@ def _unwrap_candidate(candidate: Candidate) -> Candidate:
         or candidate.code_output
     ):
         raise TransportError("Text wrapper returned an unsupported non-text response")
-    wrapped = "".join(_wrapper_call_text(call) for call in candidate.function_calls)
-    tool_signature = next(
-        (
-            str(call["thought_signature"])
-            for call in reversed(candidate.function_calls)
-            if call.get("thought_signature")
-        ),
-        "",
-    )
+    private = [
+        call
+        for call in candidate.function_calls
+        if call.get("name") == WRAPPER_TOOL_NAME
+    ]
+    external = [
+        call
+        for call in candidate.function_calls
+        if call.get("name") != WRAPPER_TOOL_NAME
+    ]
+    wrapped = "".join(_wrapper_call_text(call) for call in private)
     return replace(
         candidate,
-        text=wrapped if candidate.function_calls else candidate.text,
-        function_calls=[],
-        standalone_signature=candidate.standalone_signature or tool_signature,
+        text=wrapped if private else candidate.text,
+        function_calls=external,
     )
 
 
@@ -264,7 +367,6 @@ class TextWrapperStream:
     def __init__(self) -> None:
         self._wrapped: list[str] = []
         self._fallback: list[str] = []
-        self._signatures: list[str] = []
         self._terminal: dict[str, object | None] = {}
         self._size = 0
         self._saw_wrapper = False
@@ -288,13 +390,14 @@ class TextWrapperStream:
                 not isinstance(call, dict) for call in payload
             ):
                 raise TransportError("Text wrapper returned invalid tool calls")
+            external: list[dict[str, object]] = []
             for call in payload:
+                if call.get("name") != WRAPPER_TOOL_NAME:
+                    external.append(call)
+                    continue
                 self._saw_wrapper = True
                 self._append(self._wrapped, _wrapper_call_text(call))
-                signature = call.get("thought_signature")
-                if isinstance(signature, str) and signature:
-                    self._signatures.append(signature)
-            return []
+            return [("tool_calls", external)] if external else []
         if event_type in (
             "images",
             "reasoning_images",
@@ -318,15 +421,11 @@ class TextWrapperStream:
         if text:
             events.append(("body", text))
         events.extend(
-            ("thought_signature", signature) for signature in self._signatures
-        )
-        events.extend(
             (kind, self._terminal[kind])
             for kind in ("finish_reason", "usage", "done")
             if kind in self._terminal
         )
         self._wrapped.clear()
         self._fallback.clear()
-        self._signatures.clear()
         self._terminal.clear()
         return events
