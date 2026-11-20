@@ -94,9 +94,10 @@ def test_request_conversion_preserves_system_config_signatures_and_original():
         {"generationConfig": {"speechConfig": {}}},
         {
             "contents": [
-                {"parts": [{"inlineData": {"mimeType": "image/png", "data": "AA=="}}]}
+                {"parts": [{"fileData": {"fileUri": "https://example.test/image.png"}}]}
             ]
         },
+        {"contents": [{"parts": [{"executableCode": {"code": "print(1)"}}]}]},
         {"contents": [{"role": "tool", "parts": [{"text": "result"}]}]},
     ],
 )

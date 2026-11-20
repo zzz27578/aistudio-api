@@ -26,6 +26,10 @@ from aistudio_api.infrastructure.gateway.model_catalog import (
 BASE = "gemini-test"
 MODEL = wrapper_alias_id(BASE, ThinkingLevel.HIGH)
 SIGNATURE = base64.b64encode(b"real-external-tool-signature").decode("ascii")
+IMAGE_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH0cAAAAASUVORK5CYII="
+)
+IMAGE_DATA = base64.b64encode(IMAGE_BYTES).decode("ascii")
 USAGE = {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
 EXTERNAL_CALL = {
     "name": "lookup",
@@ -180,6 +184,10 @@ def payload(protocol, stream, *, after_tool=False, mode=None):
 
 async def invoke(protocol, stream, *, after_tool=False, mode=None):
     path, body = payload(protocol, stream, after_tool=after_tool, mode=mode)
+    return await invoke_body(path, body, stream)
+
+
+async def invoke_body(path, body, stream):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://offline.test"
     ) as client:
@@ -194,6 +202,85 @@ async def invoke(protocol, stream, *, after_tool=False, mode=None):
     ]
     assert values and not any("error" in value for value in values)
     return values
+
+
+def image_payload(protocol, stream, scenario, with_tools):
+    path, body = payload(protocol, stream, after_tool=scenario == "tool_result")
+    if not with_tools:
+        body.pop("tools")
+    if protocol == "openai":
+        image = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{IMAGE_DATA}"},
+        }
+        if scenario == "tool_result":
+            messages = body["messages"]
+            assert isinstance(messages, list)
+            last_message = messages[-1]
+            assert isinstance(last_message, dict)
+            last_message["content"] = [
+                {"type": "text", "text": "tool image"},
+                image,
+            ]
+        else:
+            image_turn = {
+                "role": "user",
+                "content": [{"type": "text", "text": "image question"}, image],
+            }
+            plain_turn = {"role": "user", "content": "plain question"}
+            signed_answer = {
+                "role": "assistant",
+                "content": "prior answer",
+                "reasoning_content": "prior thought",
+                "extra_content": {
+                    "google": {
+                        "thought_signature": SIGNATURE,
+                        "thinking_signature": SIGNATURE,
+                    }
+                },
+            }
+            body["messages"] = [
+                image_turn if scenario == "historical" else plain_turn,
+                signed_answer,
+                plain_turn if scenario == "historical" else image_turn,
+            ]
+    else:
+        image = {"inlineData": {"mimeType": "image/png", "data": IMAGE_DATA}}
+        if scenario == "tool_result":
+            contents = body["contents"]
+            assert isinstance(contents, list)
+            last_content = contents[-1]
+            assert isinstance(last_content, dict)
+            parts = last_content["parts"]
+            assert isinstance(parts, list)
+            response_part = parts[0]
+            assert isinstance(response_part, dict)
+            response = response_part["functionResponse"]
+            assert isinstance(response, dict)
+            response["parts"] = [image]
+        else:
+            image_turn = {
+                "role": "user",
+                "parts": [{"text": "image question"}, image],
+            }
+            plain_turn = {"role": "user", "parts": [{"text": "plain question"}]}
+            signed_answer = {
+                "role": "model",
+                "parts": [
+                    {
+                        "text": "prior thought",
+                        "thought": True,
+                        "thoughtSignature": SIGNATURE,
+                    },
+                    {"text": "prior answer", "thoughtSignature": SIGNATURE},
+                ],
+            }
+            body["contents"] = [
+                image_turn if scenario == "historical" else plain_turn,
+                signed_answer,
+                plain_turn if scenario == "historical" else image_turn,
+            ]
+    return path, body
 
 
 @pytest.mark.asyncio
@@ -291,3 +378,65 @@ async def test_wrapper_preserves_client_tool_selection(
         None,
         3,
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["openai", "gemini"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("scenario", ["current", "historical", "tool_result"])
+@pytest.mark.parametrize("with_tools", [False, True])
+async def test_wrapper_media_input_preserves_history_and_unwraps_final_text(
+    gateway, protocol, stream, scenario, with_tools
+):
+    upstream_output(gateway, FINAL_CALL)
+    path, body = image_payload(protocol, stream, scenario, with_tools)
+    values = await invoke_body(path, body, stream)
+    contents = gateway.prepare_request.call_args.kwargs["contents"]
+    assert [turn.role for turn in contents] == ["user", "model", "user"]
+    images = [part for turn in contents for part in turn.parts if part.inline_data]
+    assert len(images) == 1
+    assert images[0].inline_data == ("image/png", IMAGE_DATA)
+    assert base64.b64decode(images[0].inline_data[1]) == IMAGE_BYTES
+    calls = [part for turn in contents for part in turn.parts if part.function_call]
+    responses = [
+        part for turn in contents for part in turn.parts if part.function_response
+    ]
+    if scenario == "tool_result":
+        assert calls[0].function_call == ("lookup", {"query": "hello"}, "call_lookup")
+        assert calls[0].thought_signature == SIGNATURE
+        assert responses[0].function_response == (
+            "lookup",
+            {"result": "tool image"} if protocol == "openai" else {"found": "result"},
+            "call_lookup",
+        )
+        assert contents[-1].parts[-1].inline_data == ("image/png", IMAGE_DATA)
+    else:
+        assert not calls and not responses
+        prior = contents[1].parts
+        assert prior[0].text == "prior thought" and prior[0].thought is True
+        assert prior[0].thought_signature == SIGNATURE
+        assert prior[1].text == "prior answer"
+        assert prior[1].thought_signature == SIGNATURE
+        image_index = 0 if scenario == "historical" else 2
+        assert contents[image_index].parts[-1].inline_data == ("image/png", IMAGE_DATA)
+        assert contents[2 - image_index].parts[0].text == "plain question"
+    if protocol == "openai":
+        choices = [choice for value in values for choice in value.get("choices", [])]
+        field = "delta" if stream else "message"
+        assert (
+            "".join(choice[field].get("content") or "" for choice in choices)
+            == "completed answer"
+        )
+        assert choices[-1]["finish_reason"] == "stop"
+        assert not any(choice[field].get("tool_calls") for choice in choices)
+        assert values[-1]["usage"]["total_tokens"] == 12
+    else:
+        parts = [
+            part
+            for value in values
+            for candidate in value.get("candidates", [])
+            for part in candidate["content"]["parts"]
+        ]
+        assert "".join(part.get("text", "") for part in parts) == "completed answer"
+        assert not any(part.get("functionCall") for part in parts)
+        assert values[-1]["usageMetadata"]["totalTokenCount"] == 12

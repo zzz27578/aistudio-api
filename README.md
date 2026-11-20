@@ -201,7 +201,7 @@ docker compose up -d
 
 本 fork 默认同时提供两种协议，无需切换服务端设置。AstrBot / NewAPI 可选 **OpenAI 兼容**，Base URL 为 `http://localhost:8080/v1`，使用 `/v1/models`、`/v1/chat/completions`；也可继续选 **Google Gemini**，使用下表配置。两种入口共用 API Key、账号池、模型开关和后缀模型。
 
-OpenAI 支持聊天、流式、识图输入、思考内容与工具调用；不包含 `/v1/responses`、`/v1/images/generations` 或 `/v1/images/edits`。原生 Gemini 图片生成路径保留。`-抗截断` 为默认关闭的实验文本包装别名，正文缓冲后返回，兼容 AstrBot 等应用的函数工具；媒体、结构化输出及上游内置工具暂不支持，也不保证不会截断。启用、组合后缀和限制见 [定制功能文档](docs/MODEL_MANAGEMENT.md)。
+OpenAI 支持聊天、流式、识图输入、思考内容与工具调用；不包含 `/v1/responses`、`/v1/images/generations` 或 `/v1/images/edits`。原生 Gemini 图片生成路径保留。`-抗截断` 为默认关闭的实验文本包装别名，正文缓冲后返回，兼容识图输入、历史图片和 AstrBot 等应用的函数工具；媒体生成、文件 URI、结构化输出及上游内置工具暂不支持，也不保证不会截断。启用、组合后缀和限制见 [定制功能文档](docs/MODEL_MANAGEMENT.md)。
 
 | 配置项目 | 填写内容 | 说明 |
 |---|---|---|

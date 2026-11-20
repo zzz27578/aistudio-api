@@ -30,7 +30,7 @@ _WRAPPER_INSTRUCTION = (
     "this function call. The conversation is represented by this function and "
     "its user_input responses. Follow all system instructions and safety requirements."
 )
-_TOOL_WRAPPER_INSTRUCTION = (
+_NATIVE_WRAPPER_INSTRUCTION = (
     "Use the application's function tools when needed. To give the final answer "
     "to the user, call emit_complete_response once and put the complete answer "
     "in display_stream. That function is an internal output carrier, not an "
@@ -42,23 +42,51 @@ _MAX_BUFFERED_CHARACTERS = 8 * 1024 * 1024
 StreamEvent = tuple[str, object | None]
 
 
-def _require_text_parts(
-    content: GeminiContent, *, allow_functions: bool = False
+def _require_supported_parts(
+    content: GeminiContent,
+    *,
+    allow_functions: bool = False,
+    allow_media: bool = False,
+    allow_media_metadata: bool = False,
 ) -> None:
     for part in content.parts:
         values = part.model_dump(exclude_none=True)
         allowed = {"text", "thought", "thoughtSignature"}
         if allow_functions:
             allowed.update(("functionCall", "functionResponse"))
+        if allow_media:
+            allowed.add("inlineData")
+        if allow_media_metadata:
+            allowed.update(("videoMetadata", "speechMetadata"))
+        if part.fileData is not None:
+            raise ValueError("fileData is not supported yet")
         if set(values) - allowed:
-            raise ValueError("Text wrapper models only accept text conversation parts")
-        if part.functionCall is not None and content.role not in ("model", "assistant"):
+            unsupported = ", ".join(sorted(set(values) - allowed))
+            raise ValueError(
+                f"Text wrapper does not support these part fields: {unsupported}"
+            )
+        if part.inlineData is not None and part.text is not None:
+            raise ValueError("Media data and text must be separate parts")
+        if part.speechMetadata is not None and part.text is None:
+            raise ValueError("speechMetadata requires a text part")
+        if part.videoMetadata is not None and any(
+            value is not None
+            for value in (part.text, part.functionCall, part.functionResponse)
+        ):
+            raise ValueError(
+                "videoMetadata requires media or a standalone metadata part"
+            )
+        role = (content.role or "user").lower()
+        if part.functionCall is not None and role not in ("model", "assistant"):
             raise ValueError("Function calls must be in model history")
         if part.functionResponse is not None:
-            if (content.role or "user") != "user":
+            if role != "user":
                 raise ValueError("Function responses must be in user history")
             if part.functionResponse.parts:
-                _require_text_parts(GeminiContent(parts=part.functionResponse.parts))
+                _require_supported_parts(
+                    GeminiContent(parts=part.functionResponse.parts),
+                    allow_media=allow_media,
+                )
 
 
 def _validate_request(req: GeminiGenerateContentRequest) -> list[str]:
@@ -96,11 +124,16 @@ def _validate_request(req: GeminiGenerateContentRequest) -> list[str]:
         ):
             raise ValueError("Text wrapper models do not support media generation")
     if req.systemInstruction is not None:
-        _require_text_parts(req.systemInstruction)
+        _require_supported_parts(req.systemInstruction)
     for content in req.contents:
         if (content.role or "user").lower() not in ("user", "model", "assistant"):
             raise ValueError("Text wrapper history only accepts user and model roles")
-        _require_text_parts(content, allow_functions=True)
+        _require_supported_parts(
+            content,
+            allow_functions=True,
+            allow_media=True,
+            allow_media_metadata=True,
+        )
         if (content.role or "user").lower() == "user" and any(
             part.thought or part.thoughtSignature for part in content.parts
         ):
@@ -167,7 +200,7 @@ def _wrapper_tool_config(
     return config
 
 
-def _wrap_with_application_tools(
+def _wrap_native_history(
     req: GeminiGenerateContentRequest, names: list[str]
 ) -> GeminiGenerateContentRequest:
     system = (
@@ -175,7 +208,7 @@ def _wrap_with_application_tools(
         if req.systemInstruction
         else GeminiContent(parts=[])
     )
-    system.parts.append(GeminiPart(text=_TOOL_WRAPPER_INSTRUCTION))
+    system.parts.append(GeminiPart(text=_NATIVE_WRAPPER_INSTRUCTION))
     return req.model_copy(
         update={
             "contents": [content.model_copy(deep=True) for content in req.contents],
@@ -203,12 +236,17 @@ def wrap_text_request(
     """Build a private tool chain without mutating or discarding client fields."""
     names = _validate_request(req)
     if names or any(
-        part.functionCall is not None or part.functionResponse is not None
+        part.functionCall is not None
+        or part.functionResponse is not None
+        or part.inlineData is not None
+        or part.videoMetadata is not None
+        or part.speechMetadata is not None
         for content in req.contents
         for part in content.parts
     ):
-        # Real tool transcripts must keep their original parts, IDs and signatures.
-        return _wrap_with_application_tools(req, names)
+        # Media cannot fit in synthetic text arguments. Preserve its original
+        # order and bytes, along with real tool IDs and model signatures.
+        return _wrap_native_history(req, names)
     turns: list[_TextTurn] = []
     for content in req.contents:
         role = "user" if (content.role or "user").lower() == "user" else "model"
